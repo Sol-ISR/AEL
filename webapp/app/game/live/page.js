@@ -113,15 +113,6 @@ function LiveContent() {
     });
   };
 
-  const myCartelaIds = useMemo(() => new Set(myCartelas.map((c) => c.cartelaId)), [myCartelas]);
-  const bingoCandidateByCartela = useMemo(() => {
-    const map = new Map();
-    (gameState.bingoWindow?.candidates || []).forEach((c) => {
-      if (myCartelaIds.has(c.cartelaId)) map.set(c.cartelaId, c);
-    });
-    return map;
-  }, [gameState.bingoWindow, myCartelaIds]);
-
   const handleBingoTap = (cartelaId) => {
     hapticFeedback('medium');
     gameState.claimBingo(cartelaId);
@@ -201,7 +192,6 @@ function LiveContent() {
                   expiredSet={expiredNumbers}
                   manualMarked={manualMarks[c.cartelaId] || EMPTY_SET}
                   onCellTap={(number) => toggleManualDaub(c.cartelaId, number)}
-                  bingoCandidate={bingoCandidateByCartela.get(c.cartelaId) || null}
                   onBingoTap={() => handleBingoTap(c.cartelaId)}
                 />
               ))
@@ -347,7 +337,7 @@ function NoCartelasBoughtPlaceholder() {
 // to tap or that a window is closing. Server-side winner detection runs
 // off the real called numbers regardless (§4.7/§6.6) — daubing itself is
 // purely visual — but actually winning now requires a manual BINGO tap.
-function CartelaCard({ cartela, calledSet, expiredSet, manualMarked, onCellTap, bingoCandidate, onBingoTap }) {
+function CartelaCard({ cartela, calledSet, expiredSet, manualMarked, onCellTap, onBingoTap }) {
   return (
     <div
       className={`rounded-xl border p-2 ${
@@ -406,32 +396,23 @@ function CartelaCard({ cartela, calledSet, expiredSet, manualMarked, onCellTap, 
         )}
       </div>
 
-      <BingoButton candidate={bingoCandidate} onTap={onBingoTap} />
+      <BingoButton onTap={onBingoTap} />
     </div>
   );
 }
 
 // --- COMPONENT: BINGO BUTTON ---
-// Sits under every purchased cartela. Enabled and tappable only while
-// `bingoCandidate` is set (i.e. this exact cartela currently has an open
-// manual-claim window from the server) — for a few seconds or until the
-// next number is called, whichever comes first. No countdown or animation
-// is shown — the manual system deliberately gives no hint about how much
-// time is left. The server is the sole authority on whether a tap actually
-// lands in time.
-function BingoButton({ candidate, onTap }) {
-  const isLive = !!candidate;
-
+// Sits under every purchased cartela, always the same plain blue, always
+// tappable — no color change, glow, disabled state, countdown, or
+// animation to hint whether a claim window is actually open for this
+// cartela right now. Every tap just sends the claim; the server is the
+// sole authority on whether it actually lands (a tap with no open window
+// for this cartela is simply a no-op there).
+function BingoButton({ onTap }) {
   return (
     <button
-      onClick={isLive ? onTap : undefined}
-      disabled={!isLive}
-      className={[
-        'w-full mt-2 py-2.5 rounded-lg text-sm font-extrabold tracking-wide transition-colors',
-        isLive
-          ? 'bg-amber-400 text-ink active:scale-[0.97]'
-          : 'bg-[#252A34] text-mute border border-[#3A4050] opacity-60'
-      ].join(' ')}
+      onClick={onTap}
+      className="w-full mt-2 py-2.5 rounded-lg text-sm font-extrabold tracking-wide bg-sky-500 text-white active:scale-[0.97] transition-transform"
     >
       BINGO
     </button>
