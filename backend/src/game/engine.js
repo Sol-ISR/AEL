@@ -3,6 +3,7 @@ const { Game, GameCartela, Transaction, User, HouseWallet, DrawSequence } = requ
 const stateMachine = require('./stateMachine');
 const scheduler = require('./scheduler');
 const winnerDetection = require('./winnerDetection');
+const bingoClaims = require('./bingoClaims');
 const cartelaService = require('../services/cartelaService');
 const walletService = require('../services/walletService');
 const notificationService = require('../services/notificationService');
@@ -15,6 +16,11 @@ const SELECTION_TIME = scheduler.SELECTION_TIME;
 const TICK_INTERVAL = scheduler.TICK_INTERVAL;
 const DRAW_INTERVAL = Number(process.env.DRAW_INTERVAL || 3) * 1000;
 const COMPLETED_PAUSE = 4000;
+// Manual BINGO claim window (§ manual daub / manual claim redesign): once a
+// real player's cartela reaches a fresh winning pattern, their BINGO button
+// stays live for this long OR until the next number is called, whichever
+// comes first — never longer than the normal calling cadence.
+const BINGO_CLAIM_WINDOW_MS = 4000;
 
 let running = false;
 let stopRequested = false;
@@ -99,8 +105,44 @@ async function checkWinnersSoFar(game, drawSequence) {
 }
 
 /**
+ * Builds the list of cartelas eligible for a fresh BINGO claim window this
+ * draw: they must have at least one matched pattern that isn't already
+ * recorded as expired for that exact cartela (an unclaimed pattern stays
+ * expired forever for that cartela — §manual claim redesign — but a
+ * *different*, newly-completed pattern later in the round is still
+ * claimable).
+ */
+function collectClaimCandidates(winners, expiredPatternsByCartela) {
+  const candidates = [];
+  for (const w of winners) {
+    const expired = expiredPatternsByCartela.get(w.cartelaId) || new Set();
+    const freshPatterns = w.patterns.filter((p) => !expired.has(p));
+    if (freshPatterns.length > 0) {
+      candidates.push({ cartelaId: w.cartelaId, ownerId: w.ownerId, patterns: freshPatterns });
+    }
+  }
+  return candidates;
+}
+
+function markPatternsExpired(expiredPatternsByCartela, candidates) {
+  for (const c of candidates) {
+    const set = expiredPatternsByCartela.get(c.cartelaId) || new Set();
+    for (const p of c.patterns) set.add(p);
+    expiredPatternsByCartela.set(c.cartelaId, set);
+  }
+}
+
+/**
  * ACTIVE_GAMEPLAY (§6.3). Draws one number every DRAW_INTERVAL ms, persisting
  * currentDrawIndex after each draw, and checks all cartelas for winners.
+ *
+ * Manual BINGO claim redesign: a cartela reaching a fresh winning pattern
+ * no longer settles the game automatically. Instead the game opens a claim
+ * window (BINGO_CLAIM_WINDOW_MS, capped by the time until the next number
+ * would normally be called) during which that exact player can tap BINGO
+ * to actually win. If the window closes unclaimed, that pattern is marked
+ * expired for that cartela and number-calling continues — the cartela can
+ * still win later via a different pattern.
  */
 async function runActiveGameplayPhase(game) {
   const started = await stateMachine.transitionState(game.gameId, 'WAITING', 'ACTIVE', { startTime: new Date() });
@@ -117,8 +159,15 @@ async function runActiveGameplayPhase(game) {
 
   // Crash-recovery safety net: if we're resuming mid-game, re-run winner
   // detection against numbers already drawn before drawing anything new.
+  // This bootstrap path intentionally skips the manual claim window — there
+  // is no live claim history to resume, so a mid-crash winner settles
+  // instantly rather than reopening a window nobody could have seen.
   let winners = await checkWinnersSoFar(game, drawSequence);
   if (winners.length > 0) return { winners, noWinner: false };
+
+  // Per-cartela set of pattern names that have already had an unclaimed
+  // window expire — scoped to this one active-gameplay run.
+  const expiredPatternsByCartela = new Map();
 
   while (game.currentDrawIndex < 75) {
     if (stopRequested) return { aborted: true };
@@ -133,7 +182,37 @@ async function runActiveGameplayPhase(game) {
 
     const cartelas = await cartelaService.getGameCartelasWithGrids(game.gameId);
     winners = winnerDetection.checkWinners(cartelas, drawSequence.numbers.slice(0, game.currentDrawIndex));
-    if (winners.length > 0) return { winners, noWinner: false };
+    if (winners.length === 0) continue;
+
+    const candidates = collectClaimCandidates(winners, expiredPatternsByCartela);
+    if (candidates.length === 0) continue; // every matched pattern here already expired
+
+    const claimWindowStart = Date.now();
+    const windowMs = Math.min(BINGO_CLAIM_WINDOW_MS, DRAW_INTERVAL);
+    notificationService.emitToGame(game.gameId, 'bingo_window_open', {
+      gameId: game.gameId,
+      candidates: candidates.map((c) => ({ cartelaId: c.cartelaId, ownerId: c.ownerId, patterns: c.patterns })),
+      windowMs
+    });
+
+    const claimed = await bingoClaims.waitForClaim(game.gameId, candidates, windowMs);
+
+    if (claimed) {
+      const winnerRecord = winners.find((w) => w.cartelaId === claimed.cartelaId);
+      return { winners: [winnerRecord], noWinner: false };
+    }
+
+    markPatternsExpired(expiredPatternsByCartela, candidates);
+    notificationService.emitToGame(game.gameId, 'bingo_window_closed', {
+      gameId: game.gameId,
+      cartelaIds: candidates.map((c) => c.cartelaId)
+    });
+
+    // The claim window already ate into the gap before the next number —
+    // only sleep out whatever's left of DRAW_INTERVAL so calling cadence
+    // stays on schedule.
+    const remaining = DRAW_INTERVAL - (Date.now() - claimWindowStart);
+    if (remaining > 0) await sleep(remaining);
   }
 
   return { winners: [], noWinner: true };

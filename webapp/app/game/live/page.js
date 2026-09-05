@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import AuthGate from '../../../components/AuthGate';
 import { useWebSocket } from '../../../hooks/useWebSocket';
@@ -22,6 +22,9 @@ function letterFor(n) {
 }
 
 const EMPTY_SET = new Set();
+// A called number can only be manually daubed within this window of being
+// called — after it elapses, tapping does nothing (the number is "expired").
+const DAUB_WINDOW_MS = 5000;
 
 function LiveContent() {
   const router = useRouter();
@@ -32,19 +35,43 @@ function LiveContent() {
 
   const [myCartelas, setMyCartelas] = useState([]);
   const [cartelasLoaded, setCartelasLoaded] = useState(false);
-  const [autoMode, setAutoMode] = useState(true);
   const [manualMarks, setManualMarks] = useState({}); // cartelaId -> Set of manually-daubed numbers
+  const [expiredNumbers, setExpiredNumbers] = useState(EMPTY_SET); // numbers whose 5s daub window has elapsed
   const [navigatedAway, setNavigatedAway] = useState(false);
+  const daubTimers = useRef(new Map()); // number -> timeout id, so we never double-schedule
 
   useEffect(() => {
     if (!gameId) return;
-    setManualMarks({}); // fresh round — clear any manual daubs from the previous one
+    // Fresh round — clear any daub state and pending timers from the previous one.
+    setManualMarks({});
+    setExpiredNumbers(new Set());
+    daubTimers.current.forEach((id) => clearTimeout(id));
+    daubTimers.current.clear();
     api
       .getMyCartelas(gameId)
       .then(({ cartelas }) => setMyCartelas(cartelas))
       .catch(() => {})
       .finally(() => setCartelasLoaded(true));
   }, [gameId]);
+
+  // Manual daubing (fully replaces auto-daub): the instant a number is
+  // called, it becomes tappable for exactly DAUB_WINDOW_MS. Once that timer
+  // fires, the number is locked — a tap after that does nothing, even
+  // though the number was genuinely called.
+  useEffect(() => {
+    const n = gameState.lastCalled?.number;
+    if (n == null || daubTimers.current.has(n)) return;
+    const id = setTimeout(() => {
+      setExpiredNumbers((prev) => (prev.has(n) ? prev : new Set(prev).add(n)));
+      daubTimers.current.delete(n);
+    }, DAUB_WINDOW_MS);
+    daubTimers.current.set(n, id);
+  }, [gameState.lastCalled]);
+
+  useEffect(() => {
+    const timers = daubTimers.current;
+    return () => timers.forEach((id) => clearTimeout(id));
+  }, []);
 
   const handleRefresh = () => {
     if (!gameId) return;
@@ -71,19 +98,33 @@ function LiveContent() {
   const netPrizePool = gameState.grossPrizePool ? Math.floor(gameState.grossPrizePool * 0.85) : 0;
   const isSpectator = cartelasLoaded && myCartelas.length === 0;
 
-  // Manual mode: the player taps their own cells to daub them. Server-side
-  // winner detection always runs off the actually-called numbers regardless
-  // (§4.7/§6.6) — this only controls what's visually marked, so a tap only
-  // does anything for a number that's already been called.
+  // Fully manual daubing: a tap only does something for a number that has
+  // been called AND is still inside its DAUB_WINDOW_MS window. Once that
+  // window elapses the number is locked — no amount of tapping marks it.
+  // Server-side winner detection always runs off the actually-called
+  // numbers regardless (§4.7/§6.6) — daubing is purely visual/interactive.
   const toggleManualDaub = (cartelaId, number) => {
-    if (autoMode || !markedSet.has(number)) return;
+    if (!markedSet.has(number) || expiredNumbers.has(number)) return;
     hapticFeedback('light');
     setManualMarks((prev) => {
       const current = new Set(prev[cartelaId]);
-      if (current.has(number)) current.delete(number);
-      else current.add(number);
+      current.add(number); // one-way: once daubed within the window, stays daubed
       return { ...prev, [cartelaId]: current };
     });
+  };
+
+  const myCartelaIds = useMemo(() => new Set(myCartelas.map((c) => c.cartelaId)), [myCartelas]);
+  const bingoCandidateByCartela = useMemo(() => {
+    const map = new Map();
+    (gameState.bingoWindow?.candidates || []).forEach((c) => {
+      if (myCartelaIds.has(c.cartelaId)) map.set(c.cartelaId, c);
+    });
+    return map;
+  }, [gameState.bingoWindow, myCartelaIds]);
+
+  const handleBingoTap = (cartelaId) => {
+    hapticFeedback('medium');
+    gameState.claimBingo(cartelaId);
   };
 
   // Get last 10 called numbers for recent calls display
@@ -157,9 +198,11 @@ function LiveContent() {
                   key={c.cartelaId}
                   cartela={c}
                   calledSet={markedSet}
-                  autoMode={autoMode}
+                  expiredSet={expiredNumbers}
                   manualMarked={manualMarks[c.cartelaId] || EMPTY_SET}
                   onCellTap={(number) => toggleManualDaub(c.cartelaId, number)}
+                  bingoCandidate={bingoCandidateByCartela.get(c.cartelaId) || null}
+                  onBingoTap={() => handleBingoTap(c.cartelaId)}
                 />
               ))
             )}
@@ -180,14 +223,6 @@ function LiveContent() {
           className="flex-1 py-3 rounded-lg text-sm font-bold bg-[#2E3440] text-ivory border border-[#3A4050] active:scale-[0.98] transition-transform"
         >
           Refresh
-        </button>
-        <button
-          onClick={() => setAutoMode((v) => !v)}
-          className={`flex-1 py-3 rounded-lg text-sm font-bold border active:scale-[0.98] transition-transform ${
-            autoMode ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40' : 'bg-[#2E3440] text-mute border-[#3A4050]'
-          }`}
-        >
-          Auto {autoMode ? 'ON' : 'OFF'}
         </button>
       </div>
     </div>
@@ -305,12 +340,14 @@ function NoCartelasBoughtPlaceholder() {
 }
 
 // --- COMPONENT: CARTELA CARD ---
-// Auto mode: every called number is daubed automatically. Manual mode: the
-// player taps a cell themselves to daub it — only numbers that have
-// actually been called respond to a tap. Either way, server-side winner
-// detection runs off the real called numbers (§4.7/§6.6), so this is purely
-// a visual/interaction preference, never a gameplay requirement.
-function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) {
+// Fully manual daubing: a called number is tappable for DAUB_WINDOW_MS only.
+// Tapping in time daubs it (amber); missing the window locks it — same
+// plain look as any other undaubed cell, deliberately with no extra visual
+// cue, since the whole point of manual mode is that nothing hints at what
+// to tap or that a window is closing. Server-side winner detection runs
+// off the real called numbers regardless (§4.7/§6.6) — daubing itself is
+// purely visual — but actually winning now requires a manual BINGO tap.
+function CartelaCard({ cartela, calledSet, expiredSet, manualMarked, onCellTap, bingoCandidate, onBingoTap }) {
   return (
     <div
       className={`rounded-xl border p-2 ${
@@ -340,12 +377,12 @@ function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) 
           row.map((cell, c) => {
             const isFree = cell === null;
             const isCalled = isFree || calledSet.has(cell);
-            const isMarked = autoMode ? isCalled : isFree || manualMarked.has(cell);
-            // In manual mode, any called (non-free) cell can be tapped to
-            // toggle its daub on/off; a called-but-not-yet-daubed cell gets
-            // a distinct "ready to daub" pulse so it's clear it's tappable.
-            const isClickable = !autoMode && !isFree && isCalled;
-            const needsAttention = isClickable && !isMarked;
+            const isDaubed = isFree || manualMarked.has(cell);
+            const isExpired = !isFree && expiredSet.has(cell);
+            // Tappable only while the number is called, not yet daubed, and
+            // still inside its 5s window. No styling distinguishes this
+            // from a plain uncalled cell — the player has to know.
+            const isClickable = !isFree && isCalled && !isDaubed && !isExpired;
             const colAccent = COLUMN_ACCENTS[LETTERS[c]];
 
             return (
@@ -357,11 +394,9 @@ function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) 
                   'aspect-square rounded flex items-center justify-center text-xs font-mono font-bold transition-colors',
                   isFree
                     ? 'bg-emerald-500/20 text-emerald-400'
-                    : isMarked
-                    ? `bg-amber-400 text-ink${isClickable ? ' cursor-pointer' : ''}`
-                    : needsAttention
-                    ? `bg-[#252A34] ${colAccent.text} ring-2 ring-amber-400/70 animate-pulse cursor-pointer`
-                    : `bg-[#252A34] ${colAccent.text}`
+                    : isDaubed
+                    ? 'bg-amber-400 text-ink'
+                    : `bg-[#252A34] ${colAccent.text}${isClickable ? ' cursor-pointer' : ''}`
                 ].join(' ')}
               >
                 {isFree ? '★' : cell}
@@ -370,7 +405,36 @@ function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) 
           })
         )}
       </div>
+
+      <BingoButton candidate={bingoCandidate} onTap={onBingoTap} />
     </div>
+  );
+}
+
+// --- COMPONENT: BINGO BUTTON ---
+// Sits under every purchased cartela. Enabled and tappable only while
+// `bingoCandidate` is set (i.e. this exact cartela currently has an open
+// manual-claim window from the server) — for a few seconds or until the
+// next number is called, whichever comes first. No countdown or animation
+// is shown — the manual system deliberately gives no hint about how much
+// time is left. The server is the sole authority on whether a tap actually
+// lands in time.
+function BingoButton({ candidate, onTap }) {
+  const isLive = !!candidate;
+
+  return (
+    <button
+      onClick={isLive ? onTap : undefined}
+      disabled={!isLive}
+      className={[
+        'w-full mt-2 py-2.5 rounded-lg text-sm font-extrabold tracking-wide transition-colors',
+        isLive
+          ? 'bg-amber-400 text-ink active:scale-[0.97]'
+          : 'bg-[#252A34] text-mute border border-[#3A4050] opacity-60'
+      ].join(' ')}
+    >
+      BINGO
+    </button>
   );
 }
 
