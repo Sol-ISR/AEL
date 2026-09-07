@@ -95,8 +95,8 @@ function SelectionContent() {
   useEffect(() => {
     if (!gameId || status === 'WAITING' || purchasedRef.current || busy) return;
     purchasedRef.current = true;
-    router.replace(`/game/live?gameId=${gameId}&stake=${stake}`);
-  }, [gameId, status, router, busy, stake]);
+    router.replace(`/game/live?gameId=${gameId}`);
+  }, [gameId, status, router, busy]);
 
   useEffect(() => {
     if (!socket || !connected || !gameId) return undefined;
@@ -142,10 +142,10 @@ function SelectionContent() {
     };
   }, [socket, connected, gameId, router, loadAvailability]);
 
-  // The server pushes a fresh countdown_update every second, so this local
-  // interval is a resilience fallback (kept ticking during a brief dropped
-  // message or reconnect) rather than the primary source — each incoming
-  // socket payload still resyncs the value so drift never builds up.
+  // The server only pushes a fresh countdown_update every few seconds, so
+  // relying on that alone makes the on-screen number jump instead of
+  // ticking down. Run a local one-second interval between updates, and let
+  // each incoming socket payload resync the value so drift never builds up.
   useEffect(() => {
     if (countdown == null || status !== 'WAITING') return undefined;
     const t = setInterval(() => setCountdown((c) => (c == null ? c : Math.max(0, c - 1))), 1000);
@@ -181,7 +181,7 @@ function SelectionContent() {
       purchasedRef.current = true;
       notifyHaptic('success');
       await refreshProfile();
-      router.push(`/game/live?gameId=${gameId}&stake=${stake}`);
+      router.push(`/game/live?gameId=${gameId}`);
     } catch (err) {
       // If a purchase already succeeded (e.g. this was a stray duplicate
       // request settling late), the error is stale — the player already
@@ -223,7 +223,7 @@ function SelectionContent() {
           className="absolute left-0 right-0 bottom-0 h-px"
           style={{ backgroundImage: 'linear-gradient(90deg, transparent, rgba(99,102,241,0.5), transparent)' }}
         />
-        <button onClick={() => router.push(`/game/lobby?stake=${stake}`)} className="text-mute text-sm active:opacity-60">
+        <button onClick={() => router.push('/game/lobby')} className="text-mute text-sm active:opacity-60">
           ← Back
         </button>
         <div className="text-center">
