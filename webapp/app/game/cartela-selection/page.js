@@ -7,7 +7,7 @@ import { useWebSocket } from '../../../hooks/useWebSocket';
 import { api, STAKES } from '../../../lib/api';
 import { hapticFeedback, notifyHaptic } from '../../../lib/telegram';
 
-const MAX_SELECTABLE = 3;
+const MAX_SELECTABLE = 12;
 const TOTAL_CARTELAS = 400;
 
 // B/I/N/G/O accent colors — shared "brand" for the whole game flow so the
