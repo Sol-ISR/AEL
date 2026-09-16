@@ -195,7 +195,7 @@ async function submitDeposit(userId, amount, rawProof) {
   await transaction.save();
 
   // Run the 6 SMS checks (amount, recipient name, recipient phone,
-  // transaction ID format, transaction ID not reused, within 45 minutes).
+  // transaction ID format, transaction ID not reused, within 10 minutes).
   let verifyResult = { verified: false, reason: 'ERROR', checks: null };
   try {
     verifyResult = await verifyDepositDetailed({ amount, rawProof, currentTransactionId: transaction._id });
@@ -380,6 +380,10 @@ async function declineDeposit(adminRequestId, adminId, reason) {
 /** Admin manually credits a user's wallet, funded from the House Wallet (§7.2). */
 async function adminCredit(targetUserId, amount, adminId, description = 'Manual admin credit') {
   if (!(amount > 0)) throw new ApiError(400, 'INVALID_AMOUNT', 'Credit amount must be positive');
+  const maxCredit = Number(process.env.ADMIN_CREDIT_MAX_AMOUNT || 2000);
+  if (amount > maxCredit) {
+    throw new ApiError(400, 'INVALID_AMOUNT', `Credit amount cannot exceed ${maxCredit} Birr`);
+  }
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
