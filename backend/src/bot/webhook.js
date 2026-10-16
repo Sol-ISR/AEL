@@ -13,6 +13,7 @@ function createBot() {
   bot.action('balance', commands.handleBalance);
   bot.action('copy_code', commands.handleCopyCode);
   bot.action('deposit', commands.handleDepositButton);
+  bot.action(/^deposit_method_(TELEBIRR|CBE)$/, (ctx) => commands.handleDepositMethod(ctx, ctx.match[1]));
   bot.action('withdraw', commands.handleWithdrawButton);
   bot.action('support', commands.handleSupport);
   bot.action('info', commands.handleInfo);
@@ -31,6 +32,11 @@ function createBot() {
   bot.action(/^wd_decline_(.+)$/, (ctx) => commands.handleWithdrawDecision(ctx, 'decline', ctx.match[1]));
 
   bot.on('text', commands.routeTextMessage);
+
+  // CBE deposit proof is a screenshot. 'document' covers screenshots sent "as file";
+  // the handler ignores both unless the user is mid-deposit.
+  bot.on('photo', commands.handleDepositPhoto);
+  bot.on('document', commands.handleDepositPhoto);
 
   bot.catch((err, ctx) => {
     logger.error('Telegraf error', { error: err.message, stack: err.stack, updateType: ctx.updateType });

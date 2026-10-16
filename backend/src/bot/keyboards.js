@@ -59,6 +59,16 @@ function walletKeyboard() {
   ]);
 }
 
+/** Payment-method choice shown right when a player starts a deposit (§4.3). */
+function depositMethodKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('📱 Telebirr', 'deposit_method_TELEBIRR'),
+      Markup.button.callback('🏦 CBE', 'deposit_method_CBE')
+    ]
+  ]);
+}
+
 function adminPanelKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Pending Deposits', 'admin_deposits')],
@@ -113,6 +123,7 @@ module.exports = {
   removeKeyboard,
   playKeyboard,
   walletKeyboard,
+  depositMethodKeyboard,
   adminPanelKeyboard,
   approveDeclineKeyboard,
   depositActionKeyboard

@@ -4,10 +4,20 @@ const notificationService = require('../services/notificationService');
 const { redis, recordAdminPinAttempt, isAdminLockedOut } = require('../utils/redis');
 const logger = require('../utils/logger');
 const kb = require('./keyboards');
+const cbeVerification = require('../services/cbeVerification');
+const { readCbeReceipt, ALLOWED_MEDIA_TYPES, MAX_IMAGE_BYTES } = require('../services/cbeReceiptReader');
 
 const WEBAPP_URL = process.env.WEBAPP_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const DEPOSIT_PHONE = process.env.DEPOSIT_PHONE_NUMBER || '0968200522';
+// Two different CBE env vars, two different jobs:
+//  - CBE_RECIPIENT_ACCOUNT_MASKED: the masked form ("1********9222") — only its
+//    last 4 digits are used, by cbeVerification.js, to match the account shown
+//    on the receipt screenshot. Never shown to anyone.
+//  - CBE_RECIPIENT_ACCOUNT: the real, full account number depositors are
+//    told to send money to.
+const CBE_ACCOUNT = process.env.CBE_RECIPIENT_ACCOUNT || '';
+const CBE_ACCOUNT_NAME = process.env.CBE_RECIPIENT_NAME || '';
 const DEPOSIT_MIN = Number(process.env.DEPOSIT_MIN_AMOUNT || 10);
 const DEPOSIT_MAX = Number(process.env.DEPOSIT_MAX_AMOUNT || 50000);
 const WITHDRAW_MIN = Number(process.env.WITHDRAW_MIN_AMOUNT || 50);
@@ -194,17 +204,38 @@ async function handleDepositButton(ctx) {
     return ctx.reply('Deposits are for players only.');
   }
   await ack(ctx);
-  await setState(telegramId, 'AWAITING_DEPOSIT_AMOUNT');
+  await setState(telegramId, 'AWAITING_DEPOSIT_METHOD');
+  await ctx.reply('How would you like to pay?', kb.depositMethodKeyboard());
+}
+
+async function handleDepositMethod(ctx, method) {
+  const telegramId = String(ctx.from.id);
+  const user = await getUser(telegramId);
+  if (!user) return ctx.reply('Please register first.');
+  await ack(ctx);
+  await setState(telegramId, 'AWAITING_DEPOSIT_AMOUNT', { method });
   await ctx.reply(`Enter the amount you wish to deposit (min: ${DEPOSIT_MIN} Birr, max: ${DEPOSIT_MAX} Birr)`);
 }
 
 async function handleDepositAmount(ctx, text) {
   const telegramId = String(ctx.from.id);
+  const state = await getState(telegramId);
+  const method = (state && state.data && state.data.method) || 'TELEBIRR';
   const amount = Number(text.trim());
   if (!Number.isFinite(amount) || amount < DEPOSIT_MIN || amount > DEPOSIT_MAX) {
     return ctx.reply(`Please enter a valid amount between ${DEPOSIT_MIN} and ${DEPOSIT_MAX} Birr.`);
   }
-  await setState(telegramId, 'AWAITING_DEPOSIT_PROOF', { amount });
+  await setState(telegramId, 'AWAITING_DEPOSIT_PROOF', { amount, method });
+
+  if (method === 'CBE') {
+    await ctx.reply(
+      `💰 *[${amount} ብር]* ወደ CBE አካውንት 🏦: ${CBE_ACCOUNT}${CBE_ACCOUNT_NAME ? ` (${CBE_ACCOUNT_NAME})` : ''} ይላኩ።\n` +
+      `በመቀጠል ከ CBE የደረሰወትን የክፍያ ማረጋገጫ ስክሪንሾት (ሙሉውን፣ ሰዓቱንና የግብይት ቁጥሩን ጨምሮ) እዚህ ላይ ይላኩ።\n\n\n`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
   await ctx.reply(
      `💰 *[${amount} ብር]* በቴሌብር አካውንት 📱: ${DEPOSIT_PHONE} ይላኩ።\n` +
 
@@ -221,12 +252,19 @@ async function handleDepositProof(ctx, text) {
   const user = await getUser(telegramId);
   const state = await getState(telegramId);
   const amount = state.data.amount;
+  const method = state.data.method || 'TELEBIRR';
   const rawProof = text.trim();
+
+  // CBE proof is a screenshot only (handleDepositPhoto). Typed text must never
+  // reach verification, so nobody can hand-write a "receipt".
+  if (method === 'CBE') {
+    return ctx.reply('📸 Please send a screenshot of the CBE receipt (the "Transaction Completed Successfully" screen) instead of text.');
+  }
 
   await clearState(telegramId);
   await ctx.reply('🔄 Verifying your payment, please wait...');
 
-  const result = await walletService.submitDeposit(user._id, amount, rawProof);
+  const result = await walletService.submitDeposit(user._id, amount, rawProof, method);
 
   if (result.duplicate) {
     return ctx.reply(
@@ -245,10 +283,94 @@ async function handleDepositProof(ctx, text) {
     );
   }
 
-  return ctx.reply(depositFailureMessage(result.reason), { parse_mode: 'Markdown' });
+  return ctx.reply(depositFailureMessage(result.reason, method), { parse_mode: 'Markdown' });
 }
 
-function depositFailureMessage(reason) {
+// CBE deposit proof: a screenshot of the CBE app's success screen. Register with
+//   bot.on('photo', commands.handleDepositPhoto);
+//   bot.on('document', commands.handleDepositPhoto);   // screenshot sent "as file"
+async function handleDepositPhoto(ctx) {
+  const telegramId = String(ctx.from.id);
+  const state = await getState(telegramId);
+  if (!state || state.action !== 'AWAITING_DEPOSIT_PROOF') return; // not mid-deposit — ignore
+  const method = (state.data && state.data.method) || 'TELEBIRR';
+  if (method !== 'CBE') {
+    return ctx.reply('Please paste the confirmation SMS text from Telebirr (not an image).');
+  }
+
+  const msg = ctx.message;
+  let fileId;
+  let mediaType;
+  let isDocument = false;
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id; // largest size Telegram kept
+    mediaType = 'image/jpeg';
+  } else if (msg.document && ALLOWED_MEDIA_TYPES.has(msg.document.mime_type)) {
+    fileId = msg.document.file_id;
+    mediaType = msg.document.mime_type;
+    isDocument = true;
+  } else {
+    return ctx.reply('Please send the receipt as an image (JPG or PNG screenshot).');
+  }
+
+  const user = await getUser(telegramId);
+  const amount = state.data.amount;
+  await clearState(telegramId);
+  await ctx.reply('🔄 Verifying your payment, please wait...');
+
+  // Read the screenshot. If reading fails (API down, bad image) we still submit
+  // an "unreadable" proof so the deposit lands in manual review instead of vanishing.
+  let rawProof;
+  try {
+    const link = await ctx.telegram.getFileLink(fileId);
+    const res = await fetch(String(link));
+    if (!res.ok) throw new Error(`Telegram file download failed (${res.status})`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (buffer.length > MAX_IMAGE_BYTES) throw new Error('screenshot larger than 5 MB');
+    const fields = await readCbeReceipt(buffer, mediaType);
+    rawProof = cbeVerification.serializeProof(fields, fileId);
+  } catch (err) {
+    logger.error('CBE screenshot read failed', { telegramId, message: err.message });
+    rawProof = cbeVerification.serializeProof(null, fileId);
+  }
+
+  const result = await walletService.submitDeposit(user._id, amount, rawProof, 'CBE');
+
+  if (result.duplicate) {
+    return ctx.reply(
+      `⚠️ This receipt has already been submitted (status: ${result.transaction.status}). ` +
+        `If you believe this is an error, please contact support.`
+    );
+  }
+
+  if (result.verified) {
+    return ctx.reply(
+      `✅ *Deposit Successful!*\n` +
+        `Your wallet has been credited with ${amount} Birr.\n` +
+        `💰 *New Balance:* ${result.newBalance} Birr\n` +
+        `📋 *Transaction ID:* TXN-${result.transaction._id.toString().slice(-8)}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // Manual review needs the actual image, and the stored proof is only text — send it to the admin.
+  if (ADMIN_ID) {
+    try {
+      const caption =
+        `🔍 CBE screenshot needs manual review\n` +
+        `User: ${user.displayName} (${user.phone})\nAmount entered: ${amount} Birr\nReason: ${result.reason || 'n/a'}`;
+      if (isDocument) await ctx.telegram.sendDocument(ADMIN_ID, fileId, { caption });
+      else await ctx.telegram.sendPhoto(ADMIN_ID, fileId, { caption });
+    } catch (err) {
+      logger.warn('Could not forward CBE screenshot to admin', { message: err.message });
+    }
+  }
+
+  return ctx.reply(depositFailureMessage(result.reason, 'CBE'), { parse_mode: 'Markdown' });
+}
+
+function depositFailureMessage(reason, method = 'TELEBIRR') {
+  if (method === 'CBE') return cbeDepositFailureMessage(reason);
   const base = {
     UNPARSEABLE:
       `❌ *We couldn't read that as a Telebirr confirmation.*\n` +
@@ -271,6 +393,39 @@ function depositFailureMessage(reason) {
     WITHINTIMEWINDOW:
       `⏳ *This confirmation is too old to auto-verify* (must be within 10 minutes of the transaction).\n` +
       `An admin will review this manually.`
+  };
+  return (
+    base[reason] ||
+    `❌ *Deposit Verification Failed*\n` +
+      `We could not verify your payment automatically. An admin will review this request manually — ` +
+      `you'll be notified once it's confirmed.`
+  );
+}
+
+// Only honest-mistake failures get a specific message. Anti-forgery checks
+// (isCbeReceipt, fee arithmetic, ID/date consistency) fall through to the generic
+// "manual review" text so a bad actor can't learn which check tripped.
+function cbeDepositFailureMessage(reason) {
+  const base = {
+    UNPARSEABLE:
+      `❌ *We couldn't read that screenshot.*\n` +
+      `Please send the *full* CBE success screen (amount, names, date/time and transaction ID all visible). ` +
+      `An admin will review this manually.`,
+    AMOUNTMATCHES:
+      `❌ *The amount on the receipt doesn't match what you entered.*\n` +
+      `Please double check the amount, or wait for manual admin review.`,
+    RECIPIENTNAMEMATCHES:
+      `❌ *This payment doesn't appear to have been sent to our CBE account.*\n` +
+      `An admin will review this manually.`,
+    RECIPIENTACCOUNTMATCHES:
+      `❌ *This payment doesn't appear to have been sent to our CBE account.*\n` +
+      `An admin will review this manually.`,
+    RECEIPTWITHINTIMEWINDOW:
+      `⏳ *This receipt is too old to auto-verify* (must be within 10 minutes of the transaction).\n` +
+      `An admin will review this manually.`,
+    TRANSACTIONIDNOTUSED:
+      `❌ *This transaction has already been used for a previous deposit.*\n` +
+      `Each CBE receipt can only be used once. An admin will review this manually.`
   };
   return (
     base[reason] ||
@@ -607,6 +762,8 @@ module.exports = {
   handleBalance,
   handleCopyCode,
   handleDepositButton,
+  handleDepositMethod,
+  handleDepositPhoto,
   handleWithdrawButton,
   handleSupport,
   handleInfo,

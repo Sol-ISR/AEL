@@ -131,10 +131,15 @@ async function recomputeBalanceFromLedger(userId) {
  * the pasted Telebirr SMS. Idempotent on receiptNumber (§4.3 Admin Override
  * note / §8.4).
  */
-async function submitDeposit(userId, amount, rawProof) {
+async function submitDeposit(userId, amount, rawProof, method = 'TELEBIRR') {
   if (!(amount >= Number(process.env.DEPOSIT_MIN_AMOUNT || 10)) ||
       amount > Number(process.env.DEPOSIT_MAX_AMOUNT || 50000)) {
     throw new ApiError(400, 'INVALID_AMOUNT', 'Deposit amount is outside the allowed range.');
+  }
+
+  const normalizedMethod = String(method || 'TELEBIRR').toUpperCase();
+  if (!['TELEBIRR', 'CBE'].includes(normalizedMethod)) {
+    throw new ApiError(400, 'INVALID_METHOD', 'Unsupported deposit method.');
   }
 
   // Parse first so the dedup key is the actual transaction ID (stable,
@@ -143,9 +148,19 @@ async function submitDeposit(userId, amount, rawProof) {
   // different receipts). If nothing recognizable can be extracted, dedup
   // falls back to skipping the receiptNumber entirely (sparse unique index
   // permits that) and the request goes straight to manual review.
-  const { parseProofInput, verifyDepositDetailed } = require('./telebirrVerification');
+  // Method picks which verification module parses/checks the proof: Telebirr
+  // = pasted SMS text, CBE = OCR'd receipt screenshot (see cbeVerification.js).
+  const verificationModule = normalizedMethod === 'CBE'
+    ? require('./cbeVerification')
+    : require('./telebirrVerification');
+  const { parseProofInput, verifyDepositDetailed } = verificationModule;
   const parsed = parseProofInput(rawProof);
-  const dedupKey = parsed.transactionId || null;
+  // Telebirr keys stay exactly as before (so existing records still dedupe).
+  // CBE keys are prefixed so a CBE transaction ID can never collide with a
+  // Telebirr one; cbeVerification.js looks up the same "CBE-<id>" form.
+  const dedupKey = parsed.transactionId
+    ? (normalizedMethod === 'CBE' ? `CBE-${parsed.transactionId}` : parsed.transactionId)
+    : null;
 
   if (dedupKey) {
     const existing = await Transaction.findOne({ receiptNumber: dedupKey });
@@ -169,7 +184,7 @@ async function submitDeposit(userId, amount, rawProof) {
       referenceId,
       status: 'PENDING',
       description: 'Deposit pending verification',
-      metadata: { rawProof, parsedTransactionId: dedupKey }
+      metadata: { rawProof, parsedTransactionId: dedupKey, depositMethod: normalizedMethod }
     });
   } catch (err) {
     if (err.code === 11000) {
