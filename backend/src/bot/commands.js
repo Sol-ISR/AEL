@@ -230,7 +230,7 @@ async function handleDepositAmount(ctx, text) {
   if (method === 'CBE') {
     await ctx.reply(
       `💰 *[${amount} ብር]* ወደ CBE አካውንት 🏦: ${CBE_ACCOUNT}${CBE_ACCOUNT_NAME ? ` (${CBE_ACCOUNT_NAME})` : ''} ይላኩ።\n` +
-      `በመቀጠል ከ CBE የደረሰወትን የክፍያ ማረጋገጫ ስክሪንሾት (ሙሉውን፣ ሰዓቱንና የግብይት ቁጥሩን ጨምሮ) እዚህ ላይ ይላኩ።\n\n\n`,
+      `በመቀጠል በ CBE የላኩበትን የክፍያ ማረጋገጫ ስክሪንሻት እዚህ ላይ ይላኩ።\n\n\n`,
       { parse_mode: 'Markdown' }
     );
     return;
