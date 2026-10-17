@@ -72,6 +72,15 @@ services:
         value: "172800"
       - key: TELEBIRR_VERIFICATION_TIMEOUT
         value: "120"
+      # CBE deposits (screenshot OCR). Fill the three sync:false values in the dashboard.
+      - key: CBE_RECIPIENT_ACCOUNT
+        sync: false
+      - key: CBE_RECIPIENT_ACCOUNT_MASKED
+        sync: false
+      - key: CBE_RECIPIENT_NAME
+        sync: false
+      - key: CBE_MAX_AGE_MINUTES
+        value: "10"
       - key: FRONTEND_URL
         sync: false
       - key: BACKEND_URL
