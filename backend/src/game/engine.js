@@ -188,7 +188,7 @@ async function settleGame(gameId, winners, noWinner) {
 
       const commission = Math.round(grossPrizePool * HOUSE_COMMISSION_RATE * 100) / 100;
       const netPrizePool = grossPrizePool - commission;
-      const perWinner = Math.floor((netPrizePool / winners.length) * 100) / 100;
+      const perWinner = Math.floor(netPrizePool / winners.length);
       const remainder = Math.round((netPrizePool - perWinner * winners.length) * 100) / 100;
 
       // House commission — real house earning, taken from this round's escrow.
