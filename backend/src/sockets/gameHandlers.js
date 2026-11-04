@@ -1,11 +1,36 @@
 const { Game } = require('../models');
 const cartelaService = require('../services/cartelaService');
+const { getDrawnNumbers } = require('../game/drawnNumbers');
 const logger = require('../utils/logger');
+
+/**
+ * Socket handlers run outside Express, so nothing catches a rejected promise
+ * for them. On Node >= 15 an unhandled rejection kills the whole process —
+ * one Mongo timeout in join_game (likelier the more players are connected)
+ * restarted the entire platform. Every handler is therefore wrapped, and
+ * every payload is treated as untrusted (a flaky client can send null).
+ */
+function safe(name, fn) {
+  return async function wrapped(...args) {
+    try {
+      await fn(...args);
+    } catch (err) {
+      logger.warn(`Socket handler "${name}" failed`, { error: err.message });
+    }
+  };
+}
+
+function asGameId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 ? value : null;
+}
 
 async function sendFullState(socket, gameId) {
   const game = await Game.findOne({ gameId });
   if (!game) return;
-  const { real, admin, total } = await cartelaService.countSold(gameId);
+  const [{ real, admin, total }, calledNumbers] = await Promise.all([
+    cartelaService.countSold(gameId),
+    getDrawnNumbers(game)
+  ]);
   socket.emit('game_state_update', {
     gameId: game.gameId,
     status: game.status,
@@ -15,20 +40,26 @@ async function sendFullState(socket, gameId) {
     adminCartelas: admin,
     currentDrawIndex: game.currentDrawIndex,
     prizePool: game.prizePool ?? null,
-    grossPrizePool: game.grossPrizePool ?? 0
+    grossPrizePool: game.grossPrizePool ?? 0,
+    // Full list of numbers called so far: a player who (re)connects mid-round
+    // — very common on unstable mobile data — would otherwise never learn the
+    // numbers they missed, since number_drawn is only ever pushed once.
+    calledNumbers
   });
 }
 
 function registerGameHandlers(io, socket) {
-  socket.on('join_game', async ({ gameId }) => {
+  socket.on('join_game', safe('join_game', async (payload) => {
+    const gameId = asGameId(payload && payload.gameId);
     if (!gameId) return;
     socket.join(`game:${gameId}`);
     socket.currentGameId = gameId;
-    logger.info('Socket joined game room', { userId: socket.userId, gameId });
+    logger.debug('Socket joined game room', { userId: socket.userId, gameId });
     await sendFullState(socket, gameId);
-  });
+  }));
 
-  socket.on('leave_game', ({ gameId }) => {
+  socket.on('leave_game', (payload) => {
+    const gameId = asGameId(payload && payload.gameId);
     if (gameId) socket.leave(`game:${gameId}`);
     socket.currentGameId = null;
   });
@@ -37,7 +68,9 @@ function registerGameHandlers(io, socket) {
   // through POST /api/cartela/purchase (§8.6), which itself broadcasts the
   // persisted cartela_update once the atomic purchase succeeds. This event
   // just lets other players see "someone is looking at this cartela" live.
-  socket.on('select_cartela', ({ gameId, cartelaId }) => {
+  socket.on('select_cartela', (payload) => {
+    const gameId = asGameId(payload && payload.gameId);
+    const cartelaId = payload && payload.cartelaId;
     if (!gameId || !cartelaId) return;
     socket.to(`game:${gameId}`).emit('cartela_update', {
       gameId,
@@ -54,9 +87,10 @@ function registerGameHandlers(io, socket) {
     if (typeof ack === 'function') ack({ ok: true, autoMode: !!(payload && payload.enabled) });
   });
 
-  socket.on('refresh_state', async ({ gameId } = {}) => {
-    await sendFullState(socket, gameId || socket.currentGameId);
-  });
+  socket.on('refresh_state', safe('refresh_state', async (payload) => {
+    const gameId = asGameId(payload && payload.gameId) || socket.currentGameId;
+    if (gameId) await sendFullState(socket, gameId);
+  }));
 }
 
 module.exports = registerGameHandlers;

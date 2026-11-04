@@ -322,8 +322,14 @@ async function handleDepositPhoto(ctx) {
   // an "unreadable" proof so the deposit lands in manual review instead of vanishing.
   let rawProof;
   try {
-    const link = await ctx.telegram.getFileLink(fileId);
-    const res = await fetch(String(link));
+    // Neither Telegraf's getFileLink nor a bare fetch() has a timeout, so a
+    // stalled connection pinned this handler until Telegraf's 90s limit hit
+    // (Telegram then re-delivers the update). Bound both steps.
+    const link = await Promise.race([
+      ctx.telegram.getFileLink(fileId),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('getFileLink timed out')), 15000).unref())
+    ]);
+    const res = await fetch(String(link), { signal: AbortSignal.timeout(20000) });
     if (!res.ok) throw new Error(`Telegram file download failed (${res.status})`);
     const buffer = Buffer.from(await res.arrayBuffer());
     if (buffer.length > MAX_IMAGE_BYTES) throw new Error('screenshot larger than 5 MB');

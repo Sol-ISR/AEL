@@ -78,6 +78,15 @@ async function readCbeReceipt(buffer, mediaType) {
     return parseReceiptText(result.data.text);
   } catch (err) {
     logger.error('CBE receipt screenshot could not be read', { message: err.message });
+    // Promise.race above only stops WAITING for a stuck recognize(); the job
+    // keeps running inside the single shared worker, so every later deposit
+    // queued behind it would time out too. Throw the worker away so the next
+    // deposit gets a fresh one.
+    if (/timed out/i.test(err.message) && workerPromise) {
+      const stale = workerPromise;
+      workerPromise = null;
+      stale.then((w) => w.terminate()).catch(() => {});
+    }
     throw err;
   }
 }

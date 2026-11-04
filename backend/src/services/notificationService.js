@@ -8,11 +8,26 @@ function init({ bot, io }) {
   ioInstance = io;
 }
 
+const TELEGRAM_SEND_TIMEOUT_MS = 10 * 1000;
+
+/** Telegraf has no request timeout of its own; a half-open TCP connection would otherwise hang forever. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** Sends a Markdown-formatted Telegram message to a user by their telegramId. */
 async function notifyTelegram(telegramId, text) {
   if (!botInstance) return;
   try {
-    await botInstance.telegram.sendMessage(telegramId, text, { parse_mode: 'Markdown' });
+    await withTimeout(
+      botInstance.telegram.sendMessage(telegramId, text, { parse_mode: 'Markdown' }),
+      TELEGRAM_SEND_TIMEOUT_MS,
+      'Telegram sendMessage'
+    );
   } catch (err) {
     logger.warn('Failed to send Telegram notification', { telegramId, error: err.message });
   }

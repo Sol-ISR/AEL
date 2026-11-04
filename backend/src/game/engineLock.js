@@ -19,7 +19,7 @@ const mongoose = require('mongoose');
  */
 
 const LOCK_ID = 'game-engine';
-const LEASE_MS = 20_000; // how long a lease is valid once acquired/renewed
+const LEASE_MS = 45_000; // how long a lease is valid once acquired/renewed (tolerates several missed renewals)
 const RENEW_MS = 8_000; // renew well before the lease expires
 const ACQUIRE_RETRY_MS = 3_000; // how often a waiting instance retries acquisition
 

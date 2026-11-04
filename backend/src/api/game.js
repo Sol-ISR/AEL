@@ -3,6 +3,7 @@ const { Game } = require('../models');
 const { requireAuth } = require('../middleware/auth');
 const { ok, fail, paginationParams, asyncHandler, STAKES, DEFAULT_STAKE } = require('../utils/helpers');
 const cartelaService = require('../services/cartelaService');
+const { getDrawnNumbers } = require('../game/drawnNumbers');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -56,8 +57,10 @@ router.get('/state', asyncHandler(async (req, res) => {
   const game = gameId ? await Game.findOne({ gameId }) : null;
   if (!game) return fail(res, 404, 'NOT_FOUND', 'Game not found');
   const { real, admin, total } = await cartelaService.countSold(game.gameId);
+  const calledNumbers = await getDrawnNumbers(game);
   return ok(res, {
     gameState: {
+      calledNumbers,
       gameId: game.gameId,
       status: game.status,
       stake: game.stake,

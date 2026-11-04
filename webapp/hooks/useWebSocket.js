@@ -19,7 +19,16 @@ export function useWebSocket() {
     const token = getToken();
     if (!token) return undefined;
 
-    const socket = io(WS_URL, { auth: { token }, transports: ['websocket', 'polling'] });
+    const socket = io(WS_URL, {
+      auth: { token },
+      transports: ['websocket', 'polling'],
+      // Unstable networks: reconnect quickly at first, back off with jitter,
+      // never give up (default is fine) and allow a slow handshake.
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 5000,
+      randomizationFactor: 0.5,
+      timeout: 20000
+    });
     socketRef.current = socket;
     forceRender((n) => n + 1);
 

@@ -28,6 +28,20 @@ class ApiError extends Error {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 20000;
+const RETRY_STATUSES = new Set([502, 503, 504]);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * fetch() has no timeout, so on a weak connection a request could hang
+ * forever (Buy button stuck on "busy", profile never loading). Every request
+ * is bounded, and idempotent GETs are retried a couple of times on network
+ * errors / timeouts / gateway errors. POSTs are never auto-retried here:
+ * the user retries them explicitly (the purchase endpoint is idempotent).
+ */
 async function request(path, { method = 'GET', body, auth = true } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (auth) {
@@ -35,19 +49,51 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
     if (token) headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${BACKEND_URL}${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined
-  });
+  const maxAttempts = method === 'GET' ? 3 : 1;
+  let lastErr;
 
-  const json = await res.json().catch(() => ({}));
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${BACKEND_URL}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal
+      });
 
-  if (!res.ok || json.success === false) {
-    const err = json.error || {};
-    throw new ApiError(res.status, err.code || 'UNKNOWN', err.message || 'Something went wrong', err.details);
+      if (RETRY_STATUSES.has(res.status) && attempt < maxAttempts) {
+        await sleep(500 * attempt);
+        continue;
+      }
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json.success === false) {
+        const err = json.error || {};
+        throw new ApiError(res.status, err.code || 'UNKNOWN', err.message || 'Something went wrong', err.details);
+      }
+      return json.data;
+    } catch (err) {
+      if (err instanceof ApiError) throw err; // a real server answer — don't retry
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        await sleep(500 * attempt);
+        continue;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
-  return json.data;
+
+  const timedOut = lastErr && lastErr.name === 'AbortError';
+  throw new ApiError(
+    0,
+    timedOut ? 'TIMEOUT' : 'NETWORK_ERROR',
+    timedOut
+      ? 'The connection is very slow. Please check your internet and try again.'
+      : 'Could not reach the server. Please check your internet and try again.'
+  );
 }
 
 export const api = {
