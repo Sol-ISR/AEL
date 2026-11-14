@@ -23,7 +23,7 @@ const { Transaction } = require('../models');
  *   3. Recipient phone — must equal TELEBIRR_RECIPIENT_PHONE_MASKED
  *   4. Transaction ID  — must be valid format (8-15 uppercase alphanumeric)
  *   5. Transaction ID  — must not already be used
- *   6. Date & time     — must be within 45 minutes
+ *   6. Date & time     — must be within 10 minutes
  * ============================================================================
  */
 
@@ -35,7 +35,7 @@ const { Transaction } = require('../models');
 //   TELEBIRR_RECIPIENT_PHONE_MASKED  e.g. "2519****7568"
 const EXPECTED_RECIPIENT_NAME = process.env.TELEBIRR_RECIPIENT_NAME;
 const EXPECTED_RECIPIENT_PHONE_MASKED = process.env.TELEBIRR_RECIPIENT_PHONE_MASKED;
-const MAX_TRANSACTION_AGE_MINUTES = 45;
+const MAX_TRANSACTION_AGE_MINUTES = 10;
 const TRANSACTION_ID_FORMAT = /^[A-Z0-9]{8,15}$/i;
 
 if (!EXPECTED_RECIPIENT_NAME || !EXPECTED_RECIPIENT_PHONE_MASKED) {
@@ -155,7 +155,11 @@ function parseProofInput(rawText) {
  */
 function parseAmount(raw) {
   const n = parseFloat(String(raw).replace(/,/g, ''));
-  return Number.isFinite(n) ? n : null;
+  // Whole-Birr rule: the SMS always renders cents (e.g. "100.00"), but this
+  // platform never carries a fractional balance, so round to the nearest
+  // Birr before it's compared against the user-entered (already whole)
+  // amount.
+  return Number.isFinite(n) ? Math.round(n) : null;
 }
 
 /**
@@ -188,7 +192,7 @@ function parseSmsDateTime(dateTimeStr) {
 }
 
 /**
- * Check if transaction is within 45-minute window (with 5-min clock skew allowance)
+ * Check if transaction is within 10-minute window (with 5-min clock skew allowance)
  */
 function isWithinMaxAge(date) {
   if (!date) return false;
@@ -200,7 +204,10 @@ function isWithinMaxAge(date) {
  * Check if transaction ID is already used in another deposit
  */
 async function isTransactionIdAlreadyUsed(transactionId, excludeTransactionId) {
-  const query = { receiptNumber: transactionId };
+  // Matches the method-prefixed receiptNumber walletService.submitDeposit
+  // actually stores (see dedupKey there) — keeps Telebirr and CBE
+  // transaction-ID namespaces from colliding with each other.
+  const query = { receiptNumber: `TELEBIRR-${transactionId}` };
   if (excludeTransactionId) query._id = { $ne: excludeTransactionId };
   const existing = await Transaction.findOne(query).select('_id');
   return !!existing;

@@ -1,9 +1,8 @@
 const express = require('express');
-const { Game } = require('../models');
+const { Game, DrawSequence, Cartela } = require('../models');
 const { requireAuth } = require('../middleware/auth');
 const { ok, fail, paginationParams, asyncHandler, STAKES, DEFAULT_STAKE } = require('../utils/helpers');
 const cartelaService = require('../services/cartelaService');
-const { getDrawnNumbers } = require('../game/drawnNumbers');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -21,7 +20,7 @@ async function currentGameState(stake) {
     gameId: game.gameId,
     status: game.status,
     stake: game.stake,
-    playersCount: real,
+    playersCount: total, // real + house-allocated
     totalCartelas: total,
     adminCartelas: admin,
     currentDrawIndex: game.currentDrawIndex,
@@ -57,21 +56,37 @@ router.get('/state', asyncHandler(async (req, res) => {
   const game = gameId ? await Game.findOne({ gameId }) : null;
   if (!game) return fail(res, 404, 'NOT_FOUND', 'Game not found');
   const { real, admin, total } = await cartelaService.countSold(game.gameId);
-  const calledNumbers = await getDrawnNumbers(game);
+
+  // Winner-announcement page: once the game is COMPLETED, attach the numbers
+  // drawn (in call order) and each winning cartela's grid so the page can
+  // render the winning board.
+  let drawnNumbers;
+  let winners = game.winners;
+  if (game.status === 'COMPLETED' && game.winners.length > 0) {
+    const seq = game.drawSequenceId ? await DrawSequence.findById(game.drawSequenceId, { numbers: 1 }).lean() : null;
+    drawnNumbers = seq ? seq.numbers.slice(0, game.currentDrawIndex) : [];
+    const templates = await Cartela.find(
+      { cartelaId: { $in: game.winners.map((w) => w.cartelaId) } },
+      { cartelaId: 1, grid: 1 }
+    ).lean();
+    const gridById = new Map(templates.map((t) => [t.cartelaId, t.grid]));
+    winners = game.winners.map((w) => ({ ...w.toObject(), grid: gridById.get(w.cartelaId) || null }));
+  }
+
   return ok(res, {
     gameState: {
-      calledNumbers,
       gameId: game.gameId,
       status: game.status,
       stake: game.stake,
-      playersCount: real,
+      playersCount: total, // real + house-allocated
       totalCartelas: total,
       adminCartelas: admin,
       currentDrawIndex: game.currentDrawIndex,
       prizePool: game.prizePool ?? null,
       grossPrizePool: game.grossPrizePool ?? 0,
-      winners: game.winners,
-      noWinner: game.noWinner
+      winners,
+      noWinner: game.noWinner,
+      ...(drawnNumbers ? { drawnNumbers } : {})
     }
   });
 }));

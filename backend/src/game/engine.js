@@ -5,6 +5,7 @@ const scheduler = require('./scheduler');
 const winnerDetection = require('./winnerDetection');
 const cartelaService = require('../services/cartelaService');
 const walletService = require('../services/walletService');
+const houseAllocationService = require('../services/houseAllocationService');
 const notificationService = require('../services/notificationService');
 const engineLock = require('./engineLock');
 const { HOUSE_TELEGRAM_ID } = require('../utils/bootstrap');
@@ -19,30 +20,9 @@ const COMPLETED_PAUSE = 4000;
 let running = false;
 let stopRequested = false;
 let paused = false;
-let lockLost = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Retries a short DB operation a few times before giving up. A single
- * transient Mongo hiccup (pool saturation, brief network blip) in the middle
- * of the live draw loop used to abort the whole round; one quick retry is
- * almost always enough and keeps the draw cadence intact.
- */
-async function withRetry(fn, label, attempts = 3, baseDelayMs = 300) {
-  let lastErr;
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      logger.warn('Transient failure in game loop — retrying', { label, attempt: i, error: err.message });
-      if (i < attempts) await sleep(baseDelayMs * i);
-    }
-  }
-  throw lastErr;
 }
 
 /** Admin-triggered pause: the current round finishes normally, then the loop parks in WAITING without starting a new selection window until resumed (§8.6 game/stop). */
@@ -68,7 +48,7 @@ async function broadcastGameState(game, extra = {}) {
     gameId: game.gameId,
     status: game.status,
     stake: game.stake,
-    playersCount: real,
+    playersCount: total, // real + house-allocated
     totalCartelas: total,
     adminCartelas: admin,
     currentDrawIndex: game.currentDrawIndex,
@@ -76,6 +56,36 @@ async function broadcastGameState(game, extra = {}) {
     grossPrizePool: game.grossPrizePool ?? 0,
     ...extra
   });
+}
+
+/**
+ * Called right after each house purchase batch: tells every open selection
+ * screen the exact IDs (greyed out instantly, no HTTP round trip) and pushes
+ * the refreshed players / prize-pool numbers.
+ */
+async function announceHouseBatch(game, cartelaIds) {
+  notificationService.emitToGame(game.gameId, 'cartela_update', {
+    gameId: game.gameId,
+    cartelaIds,
+    status: 'sold',
+    ownerId: 'system-admin'
+  });
+  const fresh = await Game.findOne({ gameId: game.gameId });
+  if (fresh) await broadcastGameState(fresh);
+}
+
+/** Once the house is done: a single safety-net signal to re-fetch availability in case a client missed a batch. */
+async function announceHouseComplete(game, cartelaIds) {
+  notificationService.emitToGame(game.gameId, 'cartela_update', {
+    gameId: game.gameId,
+    cartelaIds,
+    status: 'bulk-allocated'
+  });
+}
+
+/** House auto-allocated cartelas in a game (excludes the globally reserved ones, which are always pre-owned). */
+async function countHouseAllocated(gameId) {
+  return GameCartela.countDocuments({ gameId, ownerId: 'system-admin', isReserved: { $ne: true } });
 }
 
 /**
@@ -92,22 +102,58 @@ async function runWaitingPhase(game) {
 
     const totalTicks = Math.ceil(SELECTION_TIME / TICK_INTERVAL);
     let realSoldEverThisWindow = false;
+    let anySoldThisWindow = false; // real OR house auto-allocated — decides whether the game runs
 
-    for (let tick = 0; tick < totalTicks; tick++) {
-      if (stopRequested) return { aborted: true };
-      await sleep(TICK_INTERVAL * 1000);
+    // House auto-allocation runs alongside the countdown: several small,
+    // naturally-spaced purchases starting in the first few seconds and spread
+    // over the first 10-20 s. Does nothing unless an admin switched it ON; while
+    // ON it pauses only after 3 rounds in a row of this stake ended with 0 real
+    // purchases, and while paused it allocates as soon as a real player buys in
+    // the round — always before the round goes ACTIVE (see
+    // houseAllocationService.runNaturalAllocation).
+    const houseCtl = { cancelled: false };
+    const housePromise = houseAllocationService.runNaturalAllocation(game, {
+      ctl: houseCtl,
+      startedAt: Date.now(),
+      selectionMs: SELECTION_TIME * 1000,
+      onBatch: (ids) => announceHouseBatch(game, ids),
+      onComplete: (ids) => announceHouseComplete(game, ids)
+    });
 
-      const elapsed = (tick + 1) * TICK_INTERVAL;
-      const remaining = Math.max(0, SELECTION_TIME - elapsed);
-      notificationService.emitToGame(game.gameId, 'countdown_update', { remainingSeconds: remaining });
+    try {
+      for (let tick = 0; tick < totalTicks; tick++) {
+        if (stopRequested) return { aborted: true };
+        await sleep(TICK_INTERVAL * 1000);
 
-      const { real } = await cartelaService.countSold(game.gameId);
-      if (real >= 1) realSoldEverThisWindow = true;
+        const elapsed = (tick + 1) * TICK_INTERVAL;
+        const remaining = Math.max(0, SELECTION_TIME - elapsed);
+        notificationService.emitToGame(game.gameId, 'countdown_update', { remainingSeconds: remaining });
+
+        const { real } = await cartelaService.countSold(game.gameId);
+        if (real >= 1) realSoldEverThisWindow = true;
+        if (real >= 1 || (await countHouseAllocated(game.gameId)) >= 1) anySoldThisWindow = true;
+      }
+    } finally {
+      // Stop the house at the end of the round and never leave the window (and
+      // start ACTIVE) with a purchase mid-flight.
+      houseCtl.cancelled = true;
+      await housePromise;
     }
 
-    if (realSoldEverThisWindow) return { aborted: false };
+    // A purchase that landed after the last 5 s check still counts.
+    if (!realSoldEverThisWindow || !anySoldThisWindow) {
+      const { real } = await cartelaService.countSold(game.gameId);
+      if (real >= 1) realSoldEverThisWindow = true;
+      if (real >= 1 || (await countHouseAllocated(game.gameId)) >= 1) anySoldThisWindow = true;
+    }
 
-    logger.info('0 real cartelas sold — restarting WAITING countdown', { gameId: game.gameId });
+    // Feeds the house's "3 consecutive rounds with 0 real purchases" pause check.
+    await houseAllocationService.recordWindowOutcome(game.stake, realSoldEverThisWindow);
+
+    // The game runs if any cartela was sold — real or house auto-allocated.
+    if (anySoldThisWindow) return { aborted: false };
+
+    logger.info('0 cartelas sold (real or auto-allocated) — restarting WAITING countdown', { gameId: game.gameId });
     notificationService.emitToGame(game.gameId, 'game_cycle_update', { newState: 'WAITING', nextState: 'WAITING' });
   }
 }
@@ -124,19 +170,10 @@ async function checkWinnersSoFar(game, drawSequence) {
  * currentDrawIndex after each draw, and checks all cartelas for winners.
  */
 async function runActiveGameplayPhase(game) {
-  if (game.status === 'WAITING') {
-    const started = await stateMachine.transitionState(game.gameId, 'WAITING', 'ACTIVE', { startTime: new Date() });
-    if (!started) throw new Error(`Failed to transition ${game.gameId} WAITING -> ACTIVE`);
-    Object.assign(game, started.toObject());
-    notificationService.emitToGame(game.gameId, 'game_cycle_update', { newState: 'ACTIVE', nextState: 'ACTIVE' });
-  } else if (game.status !== 'ACTIVE') {
-    throw new Error(`Cannot run gameplay for ${game.gameId} in status ${game.status}`);
-  }
-  // else: RESUMING a game that is already ACTIVE (crash recovery / retry after a
-  // transient error). This used to unconditionally attempt WAITING -> ACTIVE,
-  // which can never succeed for an ACTIVE game — so resuming a live round
-  // always failed and the engine abandoned it by starting a brand-new game.
-
+  const started = await stateMachine.transitionState(game.gameId, 'WAITING', 'ACTIVE', { startTime: new Date() });
+  if (!started) throw new Error(`Failed to transition ${game.gameId} WAITING -> ACTIVE`);
+  Object.assign(game, started.toObject());
+  notificationService.emitToGame(game.gameId, 'game_cycle_update', { newState: 'ACTIVE', nextState: 'ACTIVE' });
   // §2.3: game_state_update must fire on every status change, not just into
   // WAITING — clients (e.g. the cartela-selection page) key off this event's
   // `status` field to know the round went live and to redirect players who
@@ -156,25 +193,12 @@ async function runActiveGameplayPhase(game) {
 
     const number = drawSequence.numbers[game.currentDrawIndex];
     game.currentDrawIndex += 1;
-    try {
-      await withRetry(() => game.save(), 'draw:save');
-    } catch (err) {
-      game.currentDrawIndex -= 1; // not persisted — keep memory consistent with the DB before bailing out
-      throw err;
-    }
+    await game.save();
 
     const letter = ['B', 'I', 'N', 'G', 'O'][Math.floor((number - 1) / 15)];
-    // drawIndex lets a client that dropped off (flaky mobile data) notice it
-    // missed a number and ask for a full snapshot instead of silently
-    // showing a wrong board for the rest of the round.
-    notificationService.emitToGame(game.gameId, 'number_drawn', {
-      number,
-      letter,
-      drawIndex: game.currentDrawIndex,
-      timestamp: Date.now()
-    });
+    notificationService.emitToGame(game.gameId, 'number_drawn', { number, letter, timestamp: Date.now() });
 
-    const cartelas = await withRetry(() => cartelaService.getGameCartelasWithGrids(game.gameId), 'draw:load-cartelas');
+    const cartelas = await cartelaService.getGameCartelasWithGrids(game.gameId);
     winners = winnerDetection.checkWinners(cartelas, drawSequence.numbers.slice(0, game.currentDrawIndex));
     if (winners.length > 0) return { winners, noWinner: false };
   }
@@ -204,25 +228,6 @@ async function settleGame(gameId, winners, noWinner) {
       const houseUser = await User.findOne({ telegramId: HOUSE_TELEGRAM_ID }).session(session);
       const house = await HouseWallet.findOne({ walletId: 'house' }).session(session);
 
-      // Reconcile the escrow against what was actually sold. Purchases bump
-      // game.grossPrizePool with an atomic $inc right AFTER their own
-      // transaction commits (see cartelaService.purchaseCartelas); if that
-      // follow-up write ever failed (crash in the gap), the stored value would
-      // be short by one stake. Every real cartela sold cost exactly game.stake,
-      // so the true gross is rollover + realSold * stake — never pay out less.
-      const realSold = await GameCartela.countDocuments({ gameId, ownerId: { $nin: [null, 'system-admin'] } }).session(session);
-      let rolloverIn = 0;
-      if (game.rolloverFromGameId) {
-        const src = await Game.findOne({ gameId: game.rolloverFromGameId }).session(session);
-        if (src && src.noWinner) rolloverIn = src.grossPrizePool || 0;
-      }
-      const derivedGross = rolloverIn + realSold * game.stake;
-      if (derivedGross > (game.grossPrizePool || 0)) {
-        logger.warn('grossPrizePool was below the sold-cartela total — correcting at settlement', {
-          gameId, stored: game.grossPrizePool || 0, derived: derivedGross
-        });
-        game.grossPrizePool = derivedGross;
-      }
       const grossPrizePool = game.grossPrizePool || 0;
 
       if (noWinner) {
@@ -248,10 +253,15 @@ async function settleGame(gameId, winners, noWinner) {
         return;
       }
 
-      const commission = Math.round(grossPrizePool * HOUSE_COMMISSION_RATE * 100) / 100;
+      // Whole-Birr rule: no balance in this system ever carries a fraction
+      // of a Birr, so every step here rounds to a whole Birr rather than
+      // to cents. Any leftover from the per-winner division still goes to
+      // the house as HOUSE_FRACTIONAL, exactly as before — it's just now a
+      // whole-Birr leftover instead of a sub-Birr one.
+      const commission = Math.round(grossPrizePool * HOUSE_COMMISSION_RATE);
       const netPrizePool = grossPrizePool - commission;
-      const perWinner = Math.floor((netPrizePool / winners.length) * 100) / 100;
-      const remainder = Math.round((netPrizePool - perWinner * winners.length) * 100) / 100;
+      const perWinner = Math.floor(netPrizePool / winners.length);
+      const remainder = netPrizePool - perWinner * winners.length;
 
       // House commission — real house earning, taken from this round's escrow.
       if (commission > 0) {
@@ -338,6 +348,13 @@ async function settleGame(gameId, winners, noWinner) {
         if (winner.ownerId !== 'system-admin') {
           const winnerUser = await User.findById(winner.ownerId).session(session);
           winnerDisplayName = winnerUser?.displayName || null;
+        } else {
+          // House (auto-allocated) cartela: show a randomly picked name from
+          // the data/house_names list instead of a generic label, never the
+          // same name twice within one game.
+          winnerDisplayName = houseAllocationService.nextHouseName({
+            exclude: winnerRecords.filter((r) => r.ownerId === 'system-admin').map((r) => r.displayName)
+          });
         }
 
         winnerRecords.push({
@@ -379,47 +396,20 @@ async function notifyWinners(game) {
       cartelaId: w.cartelaId,
       prize: w.prizeAmount,
       pattern: w.pattern,
-      displayName: w.ownerId === 'system-admin' ? null : userById.get(String(w.ownerId))?.displayName || null
+      displayName: w.ownerId === 'system-admin' ? w.displayName || null : userById.get(String(w.ownerId))?.displayName || null
     })),
     prize: game.winners[0]?.prizeAmount || 0,
     cartelas: game.winners.map((w) => w.cartelaId)
   });
 
-  // Telegram DMs are best-effort and must never hold up the game cycle:
-  // they go out in small parallel batches, each with its own timeout (see
-  // notificationService.notifyTelegram).
-  const messages = realWinners
-    .map((w) => ({ w, user: userById.get(String(w.ownerId)) }))
-    .filter(({ user }) => !!user);
-  const BATCH = 10;
-  for (let i = 0; i < messages.length; i += BATCH) {
-    await Promise.allSettled(
-      messages.slice(i, i + BATCH).map(({ w, user }) =>
-        notificationService.notifyTelegram(
-          user.telegramId,
-          `🎉 *BINGO!*\nYour cartela #${w.cartelaId} won!\n🏆 *You received:* ${w.prizeAmount} Birr\n💰 *New balance:* ${user.mainWalletBalance} Birr`
-        )
-      )
+  for (const w of realWinners) {
+    const user = userById.get(String(w.ownerId));
+    if (!user) continue;
+    await notificationService.notifyTelegram(
+      user.telegramId,
+      `🎉 *BINGO!*\nYour cartela #${w.cartelaId} won!\n🏆 *You received:* ${w.prizeAmount} Birr\n💰 *New balance:* ${user.mainWalletBalance} Birr`
     );
   }
-}
-
-/**
- * Everything after settlement is announcement only — the money has already
- * been committed. A failure here must not throw into the stake loop (it used
- * to, which discarded the rollover and could stall the next round), and the
- * Telegram DMs are NOT awaited so a slow/hung Telegram API cannot delay the
- * next game.
- */
-async function announceSettlement(settled) {
-  try {
-    await broadcastGameState(settled);
-  } catch (err) {
-    logger.warn('broadcastGameState after settlement failed', { gameId: settled.gameId, error: err.message });
-  }
-  notifyWinners(settled).catch((err) => {
-    logger.warn('notifyWinners failed', { gameId: settled.gameId, error: err.message });
-  });
 }
 
 /** One full lifecycle pass for a given stake tier: WAITING -> ACTIVE -> SETTLING -> COMPLETED. */
@@ -433,7 +423,8 @@ async function runOneGame(stake, rolloverFromGameId = null) {
   if (aborted) return;
 
   const settled = await settleGame(game.gameId, winners, noWinner);
-  await announceSettlement(settled);
+  await broadcastGameState(settled);
+  await notifyWinners(settled);
 
   await sleep(COMPLETED_PAUSE);
 
@@ -462,7 +453,8 @@ async function recoverOnBootForStake(stake) {
     const drawnSoFar = drawSequence.numbers.slice(0, inFlight.currentDrawIndex);
     const winners = winnerDetection.checkWinners(cartelas, drawnSoFar);
     const settled = await settleGame(inFlight.gameId, winners, winners.length === 0);
-    await announceSettlement(settled);
+    await broadcastGameState(settled);
+    await notifyWinners(settled);
     return { settledGameId: settled.gameId, noWinner: settled.noWinner };
   }
 
@@ -470,23 +462,21 @@ async function recoverOnBootForStake(stake) {
     const { winners, noWinner, aborted } = await runActiveGameplayPhase(inFlight);
     if (aborted) return null;
     const settled = await settleGame(inFlight.gameId, winners, noWinner);
-    await announceSettlement(settled);
+    await broadcastGameState(settled);
+    await notifyWinners(settled);
     await sleep(COMPLETED_PAUSE);
     return { settledGameId: settled.gameId, noWinner };
   }
 
   // WAITING — simplest and safest is to restart its countdown cleanly.
-  // If the game doc was created but the process died / errored before its
-  // cartela pool finished seeding, nobody could ever buy into it: re-seed
-  // (idempotent — duplicate-key errors are ignored).
-  await cartelaService.createGameCartelaPool(inFlight.gameId);
   const waitResult = await runWaitingPhase(inFlight);
   if (waitResult.aborted) return null;
   const fresh = await Game.findOne({ gameId: inFlight.gameId });
   const { winners, noWinner, aborted } = await runActiveGameplayPhase(fresh);
   if (aborted) return null;
   const settled = await settleGame(inFlight.gameId, winners, noWinner);
-  await announceSettlement(settled);
+  await broadcastGameState(settled);
+  await notifyWinners(settled);
   await sleep(COMPLETED_PAUSE);
   return { settledGameId: settled.gameId, noWinner };
 }
@@ -499,45 +489,27 @@ async function recoverOnBootForStake(stake) {
  */
 async function runStakeLoop(stake) {
   let rolloverFromGameId = null;
-  let consecutiveFailures = 0;
+  try {
+    const recovered = await recoverOnBootForStake(stake);
+    if (recovered && recovered.noWinner) rolloverFromGameId = recovered.settledGameId || null;
+  } catch (err) {
+    logger.error('Crash recovery failed — starting a fresh game instead', { stake, error: err.message, stack: err.stack });
+  }
 
   while (!stopRequested) {
     try {
       await waitWhilePaused();
       if (stopRequested) break;
-
-      // ALWAYS resume an unfinished game before creating a new one — not just
-      // on boot. Previously any error thrown mid-round (a Mongo timeout while
-      // drawing, a failed settlement, ...) was caught here and the loop simply
-      // created a NEW game, leaving the old one stuck in ACTIVE/SETTLING
-      // forever: players' stakes stayed in escrow, their screens froze, and
-      // crash-recovery never looked at it again because it only resumes the
-      // newest in-flight game.
-      const recovered = await recoverOnBootForStake(stake);
-      if (recovered) {
-        rolloverFromGameId = recovered.noWinner ? recovered.settledGameId || null : null;
-        consecutiveFailures = 0;
-        continue;
-      }
-      if (stopRequested) break;
-
       const result = await runOneGame(stake, rolloverFromGameId);
       rolloverFromGameId = result && result.noWinner ? result.settledGameId : null;
-      consecutiveFailures = 0;
     } catch (err) {
-      consecutiveFailures += 1;
-      // NOTE: rolloverFromGameId is intentionally NOT reset here. It is only
-      // consumed once a new game has actually been created from it.
-      logger.error('Game loop iteration failed — will resume the in-flight game after a short pause', {
+      logger.error('Game loop iteration failed — retrying with a fresh game after a short pause', {
         stake,
-        consecutiveFailures,
         error: err.message,
         stack: err.stack
       });
-      if (consecutiveFailures >= 10) {
-        logger.error('CRITICAL: stake loop failing repeatedly — a round may be wedged and needs manual attention', { stake, consecutiveFailures });
-      }
-      await sleep(Math.min(5000 * consecutiveFailures, 30000));
+      await sleep(5000);
+      rolloverFromGameId = null;
     }
   }
 }
@@ -561,7 +533,6 @@ async function start() {
   if (running) return;
   running = true;
   stopRequested = false;
-  lockLost = false;
 
   const holderId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   let renewTimer = null;
@@ -578,37 +549,14 @@ async function start() {
 
     logger.info('Engine lock acquired — starting stake loops', { holderId, stakes: STAKES });
 
-    let lastRenewOkAt = Date.now();
-    let renewing = false;
     renewTimer = setInterval(async () => {
-      if (renewing) return; // don't stack renewals if the DB is slow
-      renewing = true;
-      try {
-        const stillHeld = await engineLock.renew(holderId);
-        if (stillHeld) {
-          lastRenewOkAt = Date.now();
-          return;
-        }
-        // Definitive answer from the DB: someone else owns the lease now.
+      const stillHeld = await engineLock.renew(holderId).catch((err) => {
+        logger.error('Engine lock renewal errored', { holderId, error: err.message });
+        return false;
+      });
+      if (!stillHeld) {
         logger.error('Lost engine lock — stopping loops immediately to avoid a split-brain writer', { holderId });
-        lockLost = true;
         stopRequested = true;
-      } catch (err) {
-        // A renewal that THROWS (network blip, pool saturated, Atlas failover)
-        // is not the same as losing the lock. It used to be treated as lost,
-        // which permanently stopped every game loop on the first hiccup while
-        // the HTTP server kept running — i.e. the platform looked alive but no
-        // round ever started again. Only give up once the lease could really
-        // have lapsed (and another instance could legitimately take over).
-        const sinceOk = Date.now() - lastRenewOkAt;
-        logger.warn('Engine lock renewal errored — will retry', { holderId, sinceLastOkMs: sinceOk, error: err.message });
-        if (sinceOk >= engineLock.LEASE_MS - engineLock.RENEW_MS) {
-          logger.error('Engine lock lease may have expired — stopping loops to avoid a split-brain writer', { holderId });
-          lockLost = true;
-          stopRequested = true;
-        }
-      } finally {
-        renewing = false;
       }
     }, engineLock.RENEW_MS);
 
@@ -626,9 +574,4 @@ function stop() {
   stopRequested = true;
 }
 
-/** True if the loops stopped because the lease was lost (not an orderly shutdown). */
-function wasLockLost() {
-  return lockLost;
-}
-
-module.exports = { start, stop, pause, resume, isPaused, settleGame, wasLockLost };
+module.exports = { start, stop, pause, resume, isPaused, settleGame };

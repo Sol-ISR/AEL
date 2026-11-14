@@ -4,7 +4,7 @@ const { ApiError } = require('../middleware/errorHandler');
 const walletService = require('./walletService');
 const logger = require('../utils/logger');
 
-const MAX_PER_USER = Number(process.env.MAX_CARTELAS_PER_USER || 12);
+const MAX_PER_USER = Number(process.env.MAX_CARTELAS_PER_USER || 2);
 
 /**
  * Pre-seeds a GameCartela document for every cartelaId (1-600) the moment a
@@ -69,30 +69,13 @@ async function countSold(gameId) {
   return { real, admin, total: real + admin };
 }
 
-// Cartela grids are immutable templates (§9.2), yet they were re-read from
-// Mongo (up to ~600 grids) on EVERY draw of EVERY stake tier, plus once per
-// player opening the live screen. Cache them in memory; entries missing from
-// the cache are fetched on demand, and the whole cache expires periodically
-// so a re-import of templates is picked up without a restart.
-const GRID_CACHE_TTL_MS = 10 * 60 * 1000;
-let gridCache = { at: Date.now(), map: new Map() };
-
-async function getGrids(cartelaIds) {
-  if (Date.now() - gridCache.at > GRID_CACHE_TTL_MS) gridCache = { at: Date.now(), map: new Map() };
-  const map = gridCache.map;
-  const missing = cartelaIds.filter((id) => !map.has(id));
-  if (missing.length > 0) {
-    const templates = await Cartela.find({ cartelaId: { $in: missing } }, { cartelaId: 1, grid: 1 }).lean();
-    for (const t of templates) map.set(t.cartelaId, t.grid);
-  }
-  return map;
-}
-
 /** Joins GameCartela ownership with the immutable grid template, for winner detection. */
 async function getGameCartelasWithGrids(gameId) {
   const owned = await GameCartela.find({ gameId, ownerId: { $ne: null } }, { cartelaId: 1, ownerId: 1 }).lean();
   if (owned.length === 0) return [];
-  const gridById = await getGrids(owned.map((o) => o.cartelaId));
+  const cartelaIds = owned.map((o) => o.cartelaId);
+  const templates = await Cartela.find({ cartelaId: { $in: cartelaIds } }, { cartelaId: 1, grid: 1 }).lean();
+  const gridById = new Map(templates.map((t) => [t.cartelaId, t.grid]));
   return owned.map((o) => ({ cartelaId: o.cartelaId, ownerId: o.ownerId, grid: gridById.get(o.cartelaId) }));
 }
 
@@ -122,24 +105,10 @@ async function purchaseCartelas(gameId, userId, cartelaIds) {
     throw new ApiError(409, 'CARTELA_UNAVAILABLE', 'This game is no longer accepting cartela selections.');
   }
 
-  // Count only cartelas that would be NEWLY acquired. A retry of a purchase
-  // that already went through (typical on a flaky connection: the response
-  // was lost, the player taps Buy again) must be a harmless no-op, not a
-  // "maximum cartelas" error against cartelas the player already owns.
-  const ownedByUser = await GameCartela.find({ gameId, ownerId: String(userId) }, { cartelaId: 1 }).lean();
-  const ownedSet = new Set(ownedByUser.map((d) => d.cartelaId));
-  const newIds = uniqueIds.filter((id) => !ownedSet.has(id));
-  if (ownedByUser.length + newIds.length > MAX_PER_USER) {
+  const existingForUser = await GameCartela.countDocuments({ gameId, ownerId: String(userId) });
+  if (existingForUser + uniqueIds.length > MAX_PER_USER) {
     throw new ApiError(400, 'INVALID_AMOUNT', `Maximum ${MAX_PER_USER} cartelas per user per game.`);
   }
-
-  // Reserve the ledger reference id BEFORE the transaction. It lives in one
-  // shared Counter document; incrementing it inside every purchase
-  // transaction made all concurrent buyers write-conflict with each other.
-  // A gap in the sequence (if the purchase later aborts) is harmless — the
-  // id only needs to be unique — and reusing the same id across driver
-  // retries of the transaction is exactly what we want.
-  const referenceId = await walletService.nextReferenceId();
 
   const session = await mongoose.startSession();
   const purchased = [];
@@ -148,12 +117,6 @@ async function purchaseCartelas(gameId, userId, cartelaIds) {
 
   try {
     await session.withTransaction(async () => {
-      // withTransaction re-runs this callback after a transient abort, so the
-      // accumulators MUST be reset (they used to grow duplicates on retry).
-      purchased.length = 0;
-      alreadyOwnedByUser.length = 0;
-      totalCost = 0;
-
       const user = await User.findById(userId).session(session);
       if (!user) throw new ApiError(404, 'NOT_FOUND', 'User not found');
 
@@ -184,6 +147,11 @@ async function purchaseCartelas(gameId, userId, cartelaIds) {
         user.mainWalletBalance -= totalCost;
         await user.save({ session });
 
+        // Pass `session` so the reference-id counter increments atomically
+        // with this transaction (commits/rolls back together) instead of as
+        // an independent side effect that could outlive a retried/aborted
+        // purchase attempt.
+        const referenceId = await walletService.nextReferenceId(session);
         await Transaction.create(
           [{
             userId,
@@ -198,34 +166,38 @@ async function purchaseCartelas(gameId, userId, cartelaIds) {
           { session }
         );
 
-        // NOTE: grossPrizePool is deliberately NOT incremented in here. Every
-        // purchase touching the one Game document inside a transaction made
-        // concurrent buyers abort each other (WriteConflict) and retry in a
-        // tight loop: with 20-30 players buying in the last seconds of the
-        // countdown that is hundreds of wasted transactions that saturate
-        // the DB pool and freeze the whole platform. It is applied right
-        // after commit with an atomic $inc (below) and re-derived from the
-        // sold-cartela count at settlement, so it can never under-count.
+        // ROOT CAUSE FIX (prize pool race condition): `game` was read into
+        // memory once, *before* this transaction even started (see the
+        // `Game.findOne({ gameId })` above, outside `session.withTransaction`).
+        // The old code did `game.grossPrizePool = (game.grossPrizePool||0) + totalCost`
+        // on that stale in-memory copy and then `game.save({session})`, which
+        // persists an absolute value derived from a value that may already be
+        // out of date. When two players purchase cartelas around the same
+        // moment (routine during the 45s WAITING window with multiple
+        // players), both requests read the same starting grossPrizePool,
+        // both compute "old + their own cost", and whichever save() commits
+        // last silently overwrites the other's contribution — a classic
+        // lost-update. This under-counts the real money collected for the
+        // round, so settleGame() later computes commission/netPrizePool off
+        // a grossPrizePool that's smaller than stake x real players, and
+        // winners are paid less than they should be. It reproduces
+        // intermittently (matches "sometimes erroneous") because it only
+        // triggers when purchases overlap in time.
+        //
+        // Fix: never read-modify-write a shared counter across a network
+        // round trip. Use MongoDB's atomic $inc directly, in the same
+        // session/transaction as the wallet debit and transaction record,
+        // so the increment always applies against the row's current
+        // database value regardless of concurrent purchases.
+        await Game.updateOne(
+          { gameId },
+          { $inc: { grossPrizePool: totalCost } },
+          { session }
+        );
       }
     });
   } finally {
     session.endSession();
-  }
-
-  if (totalCost > 0) {
-    // Atomic single-document $inc (no read-modify-write, no lost updates).
-    // Retried briefly; settlement reconciles from the ledger of sold
-    // cartelas if this ever fails permanently.
-    let applied = false;
-    for (let attempt = 1; attempt <= 3 && !applied; attempt++) {
-      try {
-        await Game.updateOne({ gameId }, { $inc: { grossPrizePool: totalCost } });
-        applied = true;
-      } catch (err) {
-        logger.warn('grossPrizePool increment failed after purchase commit', { gameId, attempt, error: err.message });
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 200 * attempt));
-      }
-    }
   }
 
   const user = await User.findById(userId);
@@ -240,7 +212,9 @@ async function purchaseCartelas(gameId, userId, cartelaIds) {
 async function getUserCartelas(gameId, userId) {
   const owned = await GameCartela.find({ gameId, ownerId: String(userId) }, { cartelaId: 1, isWinner: 1 }).lean();
   if (owned.length === 0) return [];
-  const gridById = await getGrids(owned.map((o) => o.cartelaId));
+  const cartelaIds = owned.map((o) => o.cartelaId);
+  const templates = await Cartela.find({ cartelaId: { $in: cartelaIds } }, { cartelaId: 1, grid: 1 }).lean();
+  const gridById = new Map(templates.map((t) => [t.cartelaId, t.grid]));
   return owned.map((o) => ({ cartelaId: o.cartelaId, grid: gridById.get(o.cartelaId), isWinner: o.isWinner }));
 }
 

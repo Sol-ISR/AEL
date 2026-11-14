@@ -18,9 +18,11 @@
   },
   "dependencies": {
     "dotenv": "^16.6.1",
+    "input": "^1.0.1",
     "mongodb": "^7.5.0",
     "mongoose": "^7.5.0",
-    "tesseract.js": "^7.0.0"
+    "telegram": "^2.26.22",
+    "xlsx": "^0.18.5"
   },
   "main": "index.js",
   "repository": {

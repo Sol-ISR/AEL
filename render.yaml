@@ -54,11 +54,25 @@ services:
         value: "1200"
       - key: HOUSE_COMMISSION
         value: "0.2"
+      - key: AMOUNT_ADMIN_CARTELAS
+        value: "10"
+      - key: ADMIN_WIN_INTERVAL
+        value: "4"
       - key: MAX_CARTELAS_PER_USER
         value: "2"
       - key: STAKE_AMOUNT
         value: "10"
       - key: DEPOSIT_PHONE_NUMBER
+        sync: false
+      - key: TELEBIRR_RECIPIENT_NAME
+        sync: false
+      - key: TELEBIRR_RECIPIENT_PHONE_MASKED
+        sync: false
+      - key: CBE_RECIPIENT_NAME
+        sync: false
+      - key: CBE_RECIPIENT_ACCOUNT
+        sync: false
+      - key: CBE_RECIPIENT_ACCOUNT_MASKED
         sync: false
       - key: DEPOSIT_MIN_AMOUNT
         value: "10"

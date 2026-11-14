@@ -1,7 +1,11 @@
-const { User, UserState, AdminRequest, Transaction, HouseWallet } = require('../models');
+const { User, UserState, AdminRequest, Transaction, HouseWallet, Game, DrawSequence } = require('../models');
 const walletService = require('../services/walletService');
 const notificationService = require('../services/notificationService');
+const reportingService = require('../services/reportingService');
+const simulatorService = require('../services/simulatorService');
+const houseAllocationService = require('../services/houseAllocationService');
 const { redis, recordAdminPinAttempt, isAdminLockedOut } = require('../utils/redis');
+const { STAKES, WELCOME_BONUS_NOTICE } = require('../utils/helpers');
 const logger = require('../utils/logger');
 const kb = require('./keyboards');
 const cbeVerification = require('../services/cbeVerification');
@@ -9,7 +13,7 @@ const { readCbeReceipt, ALLOWED_MEDIA_TYPES, MAX_IMAGE_BYTES } = require('../ser
 
 const WEBAPP_URL = process.env.WEBAPP_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
-const DEPOSIT_PHONE = process.env.DEPOSIT_PHONE_NUMBER || '0968200522';
+const DEPOSIT_PHONE = process.env.DEPOSIT_PHONE_NUMBER || '0911587568';
 // Two different CBE env vars, two different jobs:
 //  - CBE_RECIPIENT_ACCOUNT_MASKED: the masked form ("1********9222") — only its
 //    last 4 digits are used, by cbeVerification.js, to match the account shown
@@ -17,12 +21,16 @@ const DEPOSIT_PHONE = process.env.DEPOSIT_PHONE_NUMBER || '0968200522';
 //  - CBE_RECIPIENT_ACCOUNT: the real, full account number depositors are
 //    told to send money to.
 const CBE_ACCOUNT = process.env.CBE_RECIPIENT_ACCOUNT || '';
-const CBE_ACCOUNT_NAME = process.env.CBE_RECIPIENT_NAME || '';
-const DEPOSIT_MIN = Number(process.env.DEPOSIT_MIN_AMOUNT || 10);
+const CBE_ACCOUNT_NAME = process.env.CBE_RECIPIENT_NAME || 'Mekuryaw Bele Tarik';
+const DEPOSIT_MIN = Number(process.env.DEPOSIT_MIN_AMOUNT || 50);
 const DEPOSIT_MAX = Number(process.env.DEPOSIT_MAX_AMOUNT || 50000);
 const WITHDRAW_MIN = Number(process.env.WITHDRAW_MIN_AMOUNT || 50);
-const WITHDRAW_MAX = Number(process.env.WITHDRAW_MAX_AMOUNT || 15000);
+const WITHDRAW_MAX = Number(process.env.WITHDRAW_MAX_AMOUNT || 10000);
 const VERIFY_TIMEOUT_MS = Number(process.env.TELEBIRR_VERIFICATION_TIMEOUT || 120) * 1000;
+// Items per page for the paginated admin lists (Pending Deposits / Pending
+// Withdrawals) — each item is its own Telegram message (with its own
+// approve/decline buttons), so this is kept small to avoid flooding the chat.
+const ADMIN_PAGE_SIZE = 5;
 
 async function getUser(telegramId) {
   return User.findOne({ telegramId: String(telegramId) });
@@ -76,7 +84,7 @@ async function handleStart(ctx) {
 
   user.lastActive = new Date();
   await user.save();
-  await ctx.reply(`👋 Welcome back, ${user.displayName || 'Player'}!`, { ...kb.mainMenu(user) });
+  await ctx.reply(`👋 Welcome, ${user.displayName || 'Player'}!`, { ...kb.mainMenu(user) });
   return ctx.reply('👇 Quick menu', kb.persistentMenu(user));
 }
 
@@ -94,6 +102,35 @@ async function handleRegisterButton(ctx) {
   );
 }
 
+/**
+ * Links a phone-only imported account ('pending:<phone>' placeholder
+ * telegramId) to the Telegram user who just shared that phone. Returns the
+ * updated user, or null when no imported account matches. Also delivers the
+ * welcome-bonus notice that could not be sent at import time.
+ */
+async function claimImportedAccount(ctx, telegramId, phoneRaw) {
+  const digits = String(phoneRaw || '').replace(/\D/g, '');
+  if (!digits) return null;
+
+  const pending = await User.findOne({ phone: { $in: [digits, `+${digits}`] }, telegramId: /^pending:/ });
+  if (!pending) return null;
+
+  const placeholderId = pending.telegramId;
+  pending.telegramId = telegramId;
+  pending.telegramUsername = ctx.from.username;
+  pending.displayName = ctx.from.first_name || ctx.from.username || 'Player';
+  pending.lastActive = new Date();
+  await pending.save();
+
+  const placeholderState = await UserState.findOneAndDelete({ userId: placeholderId });
+  await clearState(telegramId);
+
+  if (placeholderState?.data?.welcomeBonusNoticePending) {
+    await notificationService.notifyTelegram(telegramId, WELCOME_BONUS_NOTICE);
+  }
+  return pending;
+}
+
 async function handleContact(ctx) {
   const telegramId = String(ctx.from.id);
   const contact = ctx.message.contact;
@@ -107,6 +144,17 @@ async function handleContact(ctx) {
   let user = await getUser(telegramId);
   if (user) {
     return ctx.reply('You are already registered!', kb.removeKeyboard());
+  }
+
+  // Accounts bulk-imported from a phone list (scripts/importNewusers.js) have
+  // no Telegram ID yet. If this phone matches one, the person claims that
+  // account (balance and bonus already in place) instead of creating a
+  // second one — which the unique phone index would reject anyway.
+  user = await claimImportedAccount(ctx, telegramId, contact.phone_number);
+  if (user) {
+    await ctx.reply('✅ *Registration Successful!*', { parse_mode: 'Markdown', ...kb.removeKeyboard() });
+    await ctx.reply(`Welcome, ${user.displayName}! What would you like to do?`, { ...kb.mainMenu(user) });
+    return ctx.reply('👇 Quick menu', kb.persistentMenu(user));
   }
 
   user = await User.create({
@@ -220,17 +268,17 @@ async function handleDepositMethod(ctx, method) {
 async function handleDepositAmount(ctx, text) {
   const telegramId = String(ctx.from.id);
   const state = await getState(telegramId);
-  const method = (state && state.data && state.data.method) || 'TELEBIRR';
+  const method = (state.data && state.data.method) || 'TELEBIRR';
   const amount = Number(text.trim());
-  if (!Number.isFinite(amount) || amount < DEPOSIT_MIN || amount > DEPOSIT_MAX) {
-    return ctx.reply(`Please enter a valid amount between ${DEPOSIT_MIN} and ${DEPOSIT_MAX} Birr.`);
+  if (!Number.isInteger(amount) || amount < DEPOSIT_MIN || amount > DEPOSIT_MAX) {
+    return ctx.reply(`Please enter a whole number between ${DEPOSIT_MIN} and ${DEPOSIT_MAX} Birr (no fractions).`);
   }
   await setState(telegramId, 'AWAITING_DEPOSIT_PROOF', { amount, method });
 
   if (method === 'CBE') {
     await ctx.reply(
       `💰 *[${amount} ብር]* ወደ CBE አካውንት 🏦: ${CBE_ACCOUNT}${CBE_ACCOUNT_NAME ? ` (${CBE_ACCOUNT_NAME})` : ''} ይላኩ።\n` +
-      `በመቀጠል በ CBE የላኩበትን የክፍያ ማረጋገጫ ስክሪንሻት እዚህ ላይ ይላኩ።\n\n\n`,
+      `በመቀጠል ከ CBE የደረሰወትን የክፍያ ማረጋገጫ ስክሪንሾት (ሙሉውን፣ ሰዓቱንና የግብይት ቁጥሩን ጨምሮ) እዚህ ላይ ይላኩ።\n\n\n`,
       { parse_mode: 'Markdown' }
     );
     return;
@@ -239,10 +287,7 @@ async function handleDepositAmount(ctx, text) {
   await ctx.reply(
      `💰 *[${amount} ብር]* በቴሌብር አካውንት 📱: ${DEPOSIT_PHONE} ይላኩ።\n` +
 
-     `በመቀጠል ከቴሌብር የደረሰወትን ማረጋገጫ ቴክስት (SMS) እዚህ ላይ ያስገቡ።\n\n\n` +  
-
-      `⚠️ Do not close this chat.\n` +
-      `⏳ *Verification timeout:* ${VERIFY_TIMEOUT_MS / 1000 / 60} minutes`,
+     `በመቀጠል ከቴሌብር የደረሰወትን ማረጋገጫ ቴክስት (SMS) እዚህ ላይ ያስገቡ።\n\n\n`,
     { parse_mode: 'Markdown' }
   );
 }
@@ -322,14 +367,8 @@ async function handleDepositPhoto(ctx) {
   // an "unreadable" proof so the deposit lands in manual review instead of vanishing.
   let rawProof;
   try {
-    // Neither Telegraf's getFileLink nor a bare fetch() has a timeout, so a
-    // stalled connection pinned this handler until Telegraf's 90s limit hit
-    // (Telegram then re-delivers the update). Bound both steps.
-    const link = await Promise.race([
-      ctx.telegram.getFileLink(fileId),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('getFileLink timed out')), 15000).unref())
-    ]);
-    const res = await fetch(String(link), { signal: AbortSignal.timeout(20000) });
+    const link = await ctx.telegram.getFileLink(fileId);
+    const res = await fetch(String(link));
     if (!res.ok) throw new Error(`Telegram file download failed (${res.status})`);
     const buffer = Buffer.from(await res.arrayBuffer());
     if (buffer.length > MAX_IMAGE_BYTES) throw new Error('screenshot larger than 5 MB');
@@ -377,18 +416,19 @@ async function handleDepositPhoto(ctx) {
 
 function depositFailureMessage(reason, method = 'TELEBIRR') {
   if (method === 'CBE') return cbeDepositFailureMessage(reason);
+  const providerLabel = method === 'CBE' ? 'CBE' : 'Telebirr';
   const base = {
     UNPARSEABLE:
-      `❌ *We couldn't read that as a Telebirr confirmation.*\n` +
-      `Please paste the *entire* confirmation SMS you received from Telebirr.`,
+      `❌ *We couldn't read that as a ${providerLabel} confirmation.*\n` +
+      `Please paste the *entire* confirmation SMS you received from ${providerLabel}.`,
     AMOUNTMATCHES:
       `❌ *The amount in the SMS doesn't match what you entered.*\n` +
       `Please double check the amount, or wait for manual admin review.`,
     RECIPIENTNAMEMATCHES:
-      `❌ *This payment doesn't appear to have been sent to our Telebirr account.*\n` +
+      `❌ *This payment doesn't appear to have been sent to our ${providerLabel} account.*\n` +
       `An admin will review this manually.`,
     RECIPIENTPHONEMATCHES:
-      `❌ *This payment doesn't appear to have been sent to our Telebirr account.*\n` +
+      `❌ *This payment doesn't appear to have been sent to our ${providerLabel} account.*\n` +
       `An admin will review this manually.`,
     TRANSACTIONIDFORMATVALID:
       `❌ *That doesn't look like a valid Telebirr transaction number.*\n` +
@@ -464,8 +504,8 @@ async function handleWithdrawAmount(ctx, text) {
   const amount = Number(text.trim());
   await clearState(telegramId);
 
-  if (!Number.isFinite(amount) || amount < WITHDRAW_MIN || amount > WITHDRAW_MAX) {
-    return ctx.reply(`Please enter a valid amount between ${WITHDRAW_MIN} and ${WITHDRAW_MAX} Birr.`);
+  if (!Number.isInteger(amount) || amount < WITHDRAW_MIN || amount > WITHDRAW_MAX) {
+    return ctx.reply(`Please enter a whole number between ${WITHDRAW_MIN} and ${WITHDRAW_MAX} Birr (no fractions).`);
   }
 
   try {
@@ -540,25 +580,29 @@ async function handleAdminPanel(ctx) {
   await ctx.reply('🛠️ *Admin Panel*', { parse_mode: 'Markdown', ...kb.adminPanelKeyboard() });
 }
 
-async function handleAdminDeposits(ctx) {
-  const admin = await requireAdminSession(ctx);
-  if (!admin) return;
-  await ctx.answerCbQuery();
-  // Deposits never sit at PENDING (see walletService.submitDeposit) —
-  // MANUAL_REVIEW needs an APPROVE/DECLINE, APPROVED is open/reversible
-  // until an admin explicitly REVERSEs or FINALIZEs it (no time limit).
-  // Queried separately because they need different sort orders: MANUAL_REVIEW
-  // is FIFO oldest-first (actively waiting on a decision), APPROVED is
-  // newest-first (no auto-expiry, so an unbounded backlog of older
-  // already-approved deposits would otherwise bury freshly-approved ones).
-  const [needsReview, recentlyApproved] = await Promise.all([
-    AdminRequest.find({ type: 'DEPOSIT', status: 'MANUAL_REVIEW' }).populate('userId').sort({ createdAt: 1 }).limit(10),
-    AdminRequest.find({ type: 'DEPOSIT', status: 'APPROVED' }).populate('userId').sort({ createdAt: -1 }).limit(10)
-  ]);
+// Deposits never sit at PENDING (see walletService.submitDeposit) —
+// MANUAL_REVIEW needs an APPROVE/DECLINE, APPROVED is open/reversible until
+// an admin explicitly REVERSEs or FINALIZEs it (no time limit). The two
+// sections are paginated independently (each with its own Prev/Next row)
+// because they use different sort orders: MANUAL_REVIEW is FIFO
+// oldest-first (actively waiting on a decision), APPROVED is newest-first
+// (no auto-expiry, so an unbounded backlog of older already-approved
+// deposits would otherwise bury freshly-approved ones under a fixed page).
+async function sendDepositsReviewPage(ctx, page) {
+  const total = await AdminRequest.countDocuments({ type: 'DEPOSIT', status: 'MANUAL_REVIEW' });
+  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
+  page = Math.min(Math.max(1, page), totalPages);
 
-  if (needsReview.length === 0 && recentlyApproved.length === 0) {
-    return ctx.reply('No deposits awaiting action.');
+  if (total === 0) {
+    await ctx.reply('🔍 Needs review: none.');
+    return;
   }
+
+  const needsReview = await AdminRequest.find({ type: 'DEPOSIT', status: 'MANUAL_REVIEW' })
+    .populate('userId')
+    .sort({ createdAt: 1 })
+    .skip((page - 1) * ADMIN_PAGE_SIZE)
+    .limit(ADMIN_PAGE_SIZE);
 
   for (const req of needsReview) {
     await ctx.reply(
@@ -566,26 +610,102 @@ async function handleAdminDeposits(ctx) {
       kb.depositActionKeyboard(req.status, req._id.toString())
     );
   }
+  await ctx.reply(`🔍 Needs review — page ${page}/${totalPages} (${total} total)`, kb.paginationKeyboard('admin_dep_review_page', page, totalPages));
+}
+
+async function sendDepositsApprovedPage(ctx, page) {
+  const total = await AdminRequest.countDocuments({ type: 'DEPOSIT', status: 'APPROVED' });
+  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
+  page = Math.min(Math.max(1, page), totalPages);
+
+  if (total === 0) {
+    await ctx.reply('✅ Auto-approved (reversible): none.');
+    return;
+  }
+
+  const recentlyApproved = await AdminRequest.find({ type: 'DEPOSIT', status: 'APPROVED' })
+    .populate('userId')
+    .sort({ createdAt: -1 })
+    .skip((page - 1) * ADMIN_PAGE_SIZE)
+    .limit(ADMIN_PAGE_SIZE);
+
   for (const req of recentlyApproved) {
     await ctx.reply(
       `✅ Auto-approved (reversible until you Finalize it)\nDeposit: ${req.amount} Birr from ${req.userId.displayName} (${req.userId.phone})\nProof: ${req.proof}`,
       kb.depositActionKeyboard(req.status, req._id.toString())
     );
   }
+  await ctx.reply(`✅ Auto-approved — page ${page}/${totalPages} (${total} total)`, kb.paginationKeyboard('admin_dep_approved_page', page, totalPages));
 }
 
-async function handleAdminWithdrawals(ctx) {
+async function handleAdminDeposits(ctx) {
   const admin = await requireAdminSession(ctx);
   if (!admin) return;
   await ctx.answerCbQuery();
-  const pending = await AdminRequest.find({ type: 'WITHDRAW', status: 'PENDING' }).populate('userId').limit(10);
-  if (pending.length === 0) return ctx.reply('No pending withdrawal requests.');
+  const [reviewCount, approvedCount] = await Promise.all([
+    AdminRequest.countDocuments({ type: 'DEPOSIT', status: 'MANUAL_REVIEW' }),
+    AdminRequest.countDocuments({ type: 'DEPOSIT', status: 'APPROVED' })
+  ]);
+  if (reviewCount === 0 && approvedCount === 0) {
+    return ctx.reply('No deposits awaiting action.');
+  }
+  await sendDepositsReviewPage(ctx, 1);
+  await sendDepositsApprovedPage(ctx, 1);
+}
+
+// Prev/Next taps on the "Needs review" section only re-send that section,
+// so paging doesn't re-flood the chat with the (unrelated) Approved list.
+async function handleAdminDepositsReviewPage(ctx, page) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  await sendDepositsReviewPage(ctx, Number(page));
+}
+
+async function handleAdminDepositsApprovedPage(ctx, page) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  await sendDepositsApprovedPage(ctx, Number(page));
+}
+
+async function sendWithdrawalsPage(ctx, page) {
+  const total = await AdminRequest.countDocuments({ type: 'WITHDRAW', status: 'PENDING' });
+  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
+  page = Math.min(Math.max(1, page), totalPages);
+
+  if (total === 0) {
+    await ctx.reply('No pending withdrawal requests.');
+    return;
+  }
+
+  const pending = await AdminRequest.find({ type: 'WITHDRAW', status: 'PENDING' })
+    .populate('userId')
+    .sort({ createdAt: 1 })
+    .skip((page - 1) * ADMIN_PAGE_SIZE)
+    .limit(ADMIN_PAGE_SIZE);
+
   for (const req of pending) {
     await ctx.reply(
       `Withdrawal: ${req.amount} Birr for ${req.userId.displayName} (${req.userId.phone})`,
       kb.approveDeclineKeyboard('wd', req._id.toString())
     );
   }
+  await ctx.reply(`Pending withdrawals — page ${page}/${totalPages} (${total} total)`, kb.paginationKeyboard('admin_wd_page', page, totalPages));
+}
+
+async function handleAdminWithdrawals(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  await sendWithdrawalsPage(ctx, 1);
+}
+
+async function handleAdminWithdrawalsPage(ctx, page) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  await sendWithdrawalsPage(ctx, Number(page));
 }
 
 async function handleAdminDashboard(ctx) {
@@ -605,6 +725,241 @@ async function handleAdminDashboard(ctx) {
       `Pending Withdrawals: ${pendingWithdrawals}\nTotal Players: ${totalUsers}`,
     { parse_mode: 'Markdown' }
   );
+}
+
+// "TRANSACTION" tab — daily/weekly/monthly/total summary of registered
+// users, games played per stake, finalized deposits, manual (admin)
+// credits, and approved withdrawals (see reportingService for the exact
+// bucketing rules).
+async function handleAdminTransactions(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+
+  const summary = await reportingService.getTransactionSummary();
+  const periodLabels = [
+    ['daily', '📅 Daily'],
+    ['weekly', '🗓️ Weekly'],
+    ['monthly', '📆 Monthly'],
+    ['total', '🕓 All-time']
+  ];
+
+  const lines = ['📊 *TRANSACTION SUMMARY*'];
+  for (const [key, label] of periodLabels) {
+    const gamesByStake = summary.gamesByStake[key];
+    const gamesLine = STAKES.map((s) => `${s}: ${gamesByStake[s]}`).join(', ');
+    const totalGames = STAKES.reduce((sum, s) => sum + gamesByStake[s], 0);
+    const deposits = summary.deposits[key];
+    const manualCredits = summary.manualCredits[key];
+    const withdrawals = summary.withdrawals[key];
+
+    lines.push(
+      `\n*${label}*`,
+      `👤 Registered Users: ${summary.users[key]}`,
+      `🎮 Games Played (${totalGames} total) — by stake: ${gamesLine}`,
+      `💵 Deposits (finalized): ${deposits.count} — ${deposits.total} Birr`,
+      `🎁 Manual Credit: ${manualCredits.count} — ${manualCredits.total} Birr`,
+      `💸 Withdrawals (approved): ${withdrawals.count} — ${withdrawals.total} Birr`
+    );
+  }
+
+  await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+}
+
+// "WINNERS" tab — winner(s) of every completed game: game ID, stake, net
+// prize, date/time played, and each winner's phone (+ name, when available).
+// Paginated like the deposits/withdrawals lists, newest game first.
+
+/** e.g. "Sep 12, 2026, 3:45 PM" — server-local clock, same convention used everywhere else in this file. */
+function formatGameDateTime(game) {
+  const when = game.endTime || game.startTime;
+  if (!when) return 'unknown time';
+  return new Date(when).toLocaleString('en-US', {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+  });
+}
+
+async function sendWinnersPage(ctx, page) {
+  const total = await Game.countDocuments({ status: 'COMPLETED' });
+  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
+  page = Math.min(Math.max(1, page), totalPages);
+
+  if (total === 0) {
+    await ctx.reply('🏆 No completed games yet.');
+    return;
+  }
+
+  const games = await Game.find({ status: 'COMPLETED' })
+    .sort({ endTime: -1 })
+    .skip((page - 1) * ADMIN_PAGE_SIZE)
+    .limit(ADMIN_PAGE_SIZE);
+
+  // Game.winners only stores ownerId (+ a displayName snapshot), not phone —
+  // batch-fetch every real (non-house) winner's phone in one query rather
+  // than one lookup per winner.
+  const ownerIds = [...new Set(
+    games.flatMap((g) => g.winners.map((w) => w.ownerId)).filter((id) => id !== 'system-admin')
+  )];
+  const users = ownerIds.length ? await User.find({ _id: { $in: ownerIds } }).select('phone') : [];
+  const phoneById = new Map(users.map((u) => [u._id.toString(), u.phone]));
+
+  const blocks = games.map((g) => {
+    const header = `🎮 *${g.gameId}* | Stake: ${g.stake} Birr | Net Prize: ${g.noWinner ? 0 : g.prizePool} Birr | ${formatGameDateTime(g)}`;
+    if (g.noWinner || g.winners.length === 0) {
+      return `${header}\n   ↳ No winner — pool rolled over`;
+    }
+    const winnerLines = g.winners.map((w) => {
+      if (w.ownerId === 'system-admin') {
+        return `   🏆 House (admin cartela #${w.cartelaId})`;
+      }
+      const phone = phoneById.get(w.ownerId) || 'unknown';
+      const name = w.displayName ? ` — ${w.displayName}` : '';
+      return `   🏆 ${phone}${name} — cartela #${w.cartelaId}`;
+    });
+    return `${header}\n${winnerLines.join('\n')}`;
+  });
+
+  await ctx.reply(blocks.join('\n\n'), { parse_mode: 'Markdown' });
+  await ctx.reply(`Page ${page}/${totalPages} (${total} completed games)`, kb.paginationKeyboard('admin_winners_page', page, totalPages));
+}
+
+
+async function handleAdminWinners(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  await sendWinnersPage(ctx, 1);
+}
+
+async function handleAdminWinnersPage(ctx, page) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  await sendWinnersPage(ctx, Number(page));
+}
+
+// "SIMULATOR" tab — shows the precomputed top-3 cartelas for every
+// upcoming/current game. Predictions are generated and stored immediately
+// when draw sequences are created, so this view never generates a new draw.
+//
+// Telegram's legacy Markdown parser is deliberately NOT used here. Pattern
+// names such as "DIAGONAL_LINE" contain underscores and can cause Telegram
+// to reject the whole message with "can't parse entities". HTML with proper
+// escaping is used instead, so database values can never break Telegram's
+// entity parser.
+function escapeTelegramHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\"/g, '&quot;');
+}
+
+async function sendSimulatorPage(ctx, page) {
+  // Current games first, followed by still-unclaimed future sequences.
+  const activeGames = await Game.find({
+    status: { $in: ['WAITING', 'ACTIVE', 'SETTLING'] },
+    drawSequenceId: { $ne: null }
+  }, { gameId: 1, stake: 1, status: 1, drawSequenceId: 1 }).lean();
+
+  const activeBySequence = new Map(
+    activeGames.map((game) => [String(game.drawSequenceId), game])
+  );
+
+  const activeSequenceIds = activeGames.map((game) => game.drawSequenceId);
+  const upcomingSequences = await DrawSequence.find({
+    $or: [
+      { used: false },
+      ...(activeSequenceIds.length ? [{ _id: { $in: activeSequenceIds } }] : [])
+    ]
+  })
+    .sort({ createdAt: 1, _id: 1 })
+    .lean();
+
+  const total = upcomingSequences.length;
+  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
+  page = Math.min(Math.max(1, page), totalPages);
+
+  if (total === 0) {
+    await ctx.reply('<b>🎯 SIMULATOR</b>\nNo upcoming draw sequences are currently available.', { parse_mode: 'HTML' });
+    return;
+  }
+
+  const pageItems = upcomingSequences.slice(
+    (page - 1) * ADMIN_PAGE_SIZE,
+    page * ADMIN_PAGE_SIZE
+  );
+
+  const lines = [
+    '<b>🎯 SIMULATOR — PRECOMPUTED WINNERS</b>',
+    `Showing <b>${pageItems.length}</b> of <b>${total}</b> upcoming/current sequence(s).`,
+    'The list is generated from the stored 75-number draw order and the 200 cartela master set.',
+    ''
+  ];
+
+  pageItems.forEach((sequence, index) => {
+    const game = activeBySequence.get(String(sequence._id));
+    const position = (page - 1) * ADMIN_PAGE_SIZE + index + 1;
+    const status = game
+      ? `GAME ${game.gameId} · ${game.stake} Birr · ${game.status}`
+      : 'UPCOMING · not yet claimed';
+
+    lines.push(`<b>${position}. ${escapeTelegramHtml(status)}</b>`);
+    lines.push(`Sequence: <code>${escapeTelegramHtml(String(sequence._id).slice(-8))}</code>`);
+
+    const winners = (sequence.predictedWinners || []).slice(0, 3);
+    if (winners.length === 0) {
+      lines.push('⚠️ No top-3 prediction is stored for this sequence.');
+    } else {
+      winners.forEach((winner) => {
+        const patterns = Array.isArray(winner.patterns) && winner.patterns.length
+          ? winner.patterns.join(', ')
+          : 'UNKNOWN_PATTERN';
+        lines.push(
+          `${escapeTelegramHtml(winner.rank)}. Cartela <b>#${escapeTelegramHtml(winner.cartelaId)}</b>` +
+          ` — draw <b>#${escapeTelegramHtml(winner.drawIndex)}</b>` +
+          ` (${escapeTelegramHtml(winner.drawNumber)})` +
+          ` — <code>${escapeTelegramHtml(patterns)}</code>`
+        );
+      });
+    }
+
+    lines.push('');
+  });
+
+  lines.push(`Page <b>${page}/${totalPages}</b>`);
+
+  await ctx.reply(lines.join('\n'), {
+    parse_mode: 'HTML',
+    ...kb.paginationKeyboard('admin_simulator_page', page, totalPages)
+  });
+}
+
+async function handleAdminSimulator(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  try {
+    // Backfill any old sequences that predate this feature before displaying.
+    await simulatorService.ensurePredictionsForExistingSequences();
+    await sendSimulatorPage(ctx, 1);
+  } catch (err) {
+    logger.error('Simulator admin view failed', { error: err.message, stack: err.stack });
+    await ctx.reply(`⚠️ Simulator unavailable: ${err.message}`);
+  }
+}
+
+async function handleAdminSimulatorPage(ctx, page) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ctx.answerCbQuery();
+  try {
+    await simulatorService.ensurePredictionsForExistingSequences();
+    await sendSimulatorPage(ctx, Number(page));
+  } catch (err) {
+    logger.error('Simulator admin page failed', { error: err.message, stack: err.stack });
+    await ctx.reply(`⚠️ Simulator unavailable: ${err.message}`);
+  }
 }
 
 async function handleDepositDecision(ctx, action, id) {
@@ -673,6 +1028,103 @@ async function handleWithdrawDecision(ctx, action, id) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Admin: house AUTO-ALLOCATION (ON/OFF switch + AMOUNT_ADMIN_CARTELAS)
+// ---------------------------------------------------------------------------
+
+async function buildAutoAllocationPanel() {
+  const settings = await houseAllocationService.getAutoAllocationSettings();
+  const limit = houseAllocationService.EMPTY_ROUNDS_TO_PAUSE;
+  const perStake = await Promise.all(
+    STAKES.map(async (stake) => {
+      const empty = await houseAllocationService.getEmptyStreak(stake);
+      const state = !settings.enabled ? '' : empty >= limit ? ' — ⏸ paused' : ' — active';
+      return `${stake} Birr: <b>${empty}</b> empty round(s) in a row${state}`;
+    })
+  );
+  const text = [
+    '<b>🏠 AUTO-ALLOCATION</b>',
+    `Status: <b>${settings.enabled ? 'ON ✅' : 'OFF ⛔'}</b>`,
+    `Cartelas per game (AMOUNT_ADMIN_CARTELAS): <b>${settings.amount}</b>`,
+    `ADMIN-WIN-INTERVAL: <b>${settings.adminWinInterval > 0 ? `every ${settings.adminWinInterval} game(s)` : 'OFF'}</b>`,
+    '',
+    perStake.join('\n')
+  ].join('\n');
+  return { text, keyboard: kb.autoAllocationKeyboard(settings.enabled) };
+}
+
+async function handleAdminAutoAlloc(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ack(ctx);
+  const { text, keyboard } = await buildAutoAllocationPanel();
+  await ctx.reply(text, { parse_mode: 'HTML', ...keyboard });
+}
+
+async function handleAdminAutoAllocToggle(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  const current = await houseAllocationService.getAutoAllocationSettings();
+  const updated = await houseAllocationService.setAutoAllocationEnabled(!current.enabled, ctx.from.id);
+  await ctx.answerCbQuery(`Auto-allocation is now ${updated.enabled ? 'ON' : 'OFF'}`);
+  const { text, keyboard } = await buildAutoAllocationPanel();
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard });
+  } catch (_) {
+    await ctx.reply(text, { parse_mode: 'HTML', ...keyboard }); // message too old to edit
+  }
+}
+
+async function handleAdminAutoAllocAmountButton(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ack(ctx);
+  await setState(String(ctx.from.id), 'AWAITING_ADMIN_AUTOALLOC_AMOUNT');
+  await ctx.reply(`Enter how many cartelas the house should auto-allocate per game (whole number, 0–${houseAllocationService.MAX_AMOUNT_ADMIN_CARTELAS}):`);
+}
+
+async function handleAdminAutoAllocPredictedButton(ctx) {
+  const admin = await requireAdminSession(ctx);
+  if (!admin) return;
+  await ack(ctx);
+  await setState(String(ctx.from.id), 'AWAITING_ADMIN_PREDICTED_EVERY');
+  await ctx.reply(`Enter ADMIN-WIN-INTERVAL: the house buys the predicted rank-1 winner cartela every N games (whole number, 0–${houseAllocationService.MAX_ADMIN_WIN_INTERVAL}; 0 = off):`);
+}
+
+async function handleAdminAutoAllocPredicted(ctx, text) {
+  const telegramId = String(ctx.from.id);
+  const admin = await getUser(telegramId);
+  if (!admin || !admin.isAdmin) {
+    await clearState(telegramId);
+    return ctx.reply('Admins only.');
+  }
+  try {
+    await houseAllocationService.setAdminWinInterval(text.trim(), telegramId);
+  } catch (err) {
+    return ctx.reply(`⚠️ ${err.message} Try again, or tap a menu button to cancel.`); // state kept so they can retry
+  }
+  await clearState(telegramId);
+  const panel = await buildAutoAllocationPanel();
+  await ctx.reply(`✅ Saved.\n\n${panel.text}`, { parse_mode: 'HTML', ...panel.keyboard });
+}
+
+async function handleAdminAutoAllocAmount(ctx, text) {
+  const telegramId = String(ctx.from.id);
+  const admin = await getUser(telegramId);
+  if (!admin || !admin.isAdmin) {
+    await clearState(telegramId);
+    return ctx.reply('Admins only.');
+  }
+  try {
+    await houseAllocationService.setAmountAdminCartelas(text.trim(), telegramId);
+  } catch (err) {
+    return ctx.reply(`⚠️ ${err.message} Try again, or tap a menu button to cancel.`); // state kept so they can retry
+  }
+  await clearState(telegramId);
+  const panel = await buildAutoAllocationPanel();
+  await ctx.reply(`✅ Amount saved.\n\n${panel.text}`, { parse_mode: 'HTML', ...panel.keyboard });
+}
+
 async function handleAdminCreditButton(ctx) {
   const admin = await requireAdminSession(ctx);
   if (!admin) return;
@@ -696,7 +1148,7 @@ async function handleAdminCreditAmount(ctx, text) {
   const amount = Number(text.trim());
   await clearState(telegramId);
 
-  if (!Number.isFinite(amount) || amount <= 0) return ctx.reply('Invalid amount.');
+  if (!Number.isInteger(amount) || amount <= 0) return ctx.reply('Invalid amount — enter a whole number of Birr (no fractions).');
 
   try {
     const { newBalance } = await walletService.adminCredit(state.data.targetUserId, amount, admin._id, 'Manual admin credit');
@@ -755,6 +1207,10 @@ async function routeTextMessage(ctx) {
       return handleAdminCreditTarget(ctx, text);
     case 'AWAITING_ADMIN_CREDIT_AMOUNT':
       return handleAdminCreditAmount(ctx, text);
+    case 'AWAITING_ADMIN_AUTOALLOC_AMOUNT':
+      return handleAdminAutoAllocAmount(ctx, text);
+    case 'AWAITING_ADMIN_PREDICTED_EVERY':
+      return handleAdminAutoAllocPredicted(ctx, text);
     default:
       return;
   }
@@ -775,8 +1231,20 @@ module.exports = {
   handleInfo,
   handleAdminPanel,
   handleAdminDeposits,
+  handleAdminDepositsReviewPage,
+  handleAdminDepositsApprovedPage,
   handleAdminWithdrawals,
+  handleAdminWithdrawalsPage,
   handleAdminDashboard,
+  handleAdminTransactions,
+  handleAdminWinners,
+  handleAdminWinnersPage,
+  handleAdminSimulator,
+  handleAdminSimulatorPage,
+  handleAdminAutoAlloc,
+  handleAdminAutoAllocToggle,
+  handleAdminAutoAllocAmountButton,
+  handleAdminAutoAllocPredictedButton,
   handleDepositDecision,
   handleWithdrawDecision,
   handleAdminCreditButton,

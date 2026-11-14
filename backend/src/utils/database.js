@@ -19,15 +19,7 @@ function connectDatabase() {
   connecting = mongoose
     .connect(uri, {
       dbName: process.env.MONGODB_DB_NAME || 'BINGCL',
-      // The game engine, every REST request, every socket handshake and every
-      // purchase transaction share this one pool. 20 was easily exhausted
-      // by a burst of ~30 players (each purchase = ~10 sequential ops), and
-      // because the default wait-queue timeout is "forever", the engine's own
-      // draw queries queued behind them and the round appeared frozen.
-      maxPoolSize: 60,
-      minPoolSize: 5,
-      waitQueueTimeoutMS: 20000, // fail fast (and get retried) instead of hanging forever
-      socketTimeoutMS: 45000,
+      maxPoolSize: 20,
       serverSelectionTimeoutMS: 10000
     })
     .then((conn) => {

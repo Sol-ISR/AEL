@@ -20,9 +20,21 @@ function createBot() {
 
   bot.action('admin_panel', commands.handleAdminPanel);
   bot.action('admin_deposits', commands.handleAdminDeposits);
+  bot.action(/^admin_dep_review_page_(\d+)$/, (ctx) => commands.handleAdminDepositsReviewPage(ctx, ctx.match[1]));
+  bot.action(/^admin_dep_approved_page_(\d+)$/, (ctx) => commands.handleAdminDepositsApprovedPage(ctx, ctx.match[1]));
   bot.action('admin_withdrawals', commands.handleAdminWithdrawals);
+  bot.action(/^admin_wd_page_(\d+)$/, (ctx) => commands.handleAdminWithdrawalsPage(ctx, ctx.match[1]));
   bot.action('admin_dashboard', commands.handleAdminDashboard);
+  bot.action('admin_transactions', commands.handleAdminTransactions);
+  bot.action('admin_winners', commands.handleAdminWinners);
+  bot.action('admin_simulator', commands.handleAdminSimulator);
+  bot.action(/^admin_simulator_page_(\d+)$/, (ctx) => commands.handleAdminSimulatorPage(ctx, ctx.match[1]));
+  bot.action(/^admin_winners_page_(\d+)$/, (ctx) => commands.handleAdminWinnersPage(ctx, ctx.match[1]));
   bot.action('admin_credit', commands.handleAdminCreditButton);
+  bot.action('admin_autoalloc', commands.handleAdminAutoAlloc);
+  bot.action('admin_autoalloc_toggle', commands.handleAdminAutoAllocToggle);
+  bot.action('admin_autoalloc_amount', commands.handleAdminAutoAllocAmountButton);
+  bot.action('admin_autoalloc_predicted', commands.handleAdminAutoAllocPredictedButton);
 
   bot.action(/^dep_approve_(.+)$/, (ctx) => commands.handleDepositDecision(ctx, 'approve', ctx.match[1]));
   bot.action(/^dep_decline_(.+)$/, (ctx) => commands.handleDepositDecision(ctx, 'decline', ctx.match[1]));

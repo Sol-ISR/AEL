@@ -7,8 +7,8 @@ import { useWebSocket } from '../../../hooks/useWebSocket';
 import { api, STAKES } from '../../../lib/api';
 import { hapticFeedback, notifyHaptic } from '../../../lib/telegram';
 
-const MAX_SELECTABLE = 12;
-const TOTAL_CARTELAS = 400;
+const MAX_SELECTABLE = 6;
+const TOTAL_CARTELAS = 200;
 
 // B/I/N/G/O accent colors — shared "brand" for the whole game flow so the
 // selection grid and the live board read as the same product.
@@ -48,6 +48,7 @@ function SelectionContent() {
   // though it had already gone through. A ref is checked/set synchronously,
   // before any re-render, so it closes that race completely.
   const purchaseInProgressRef = useRef(false);
+  const statusRef = useRef(null); // last known round status, to tell a NEW round from a refresh of the current one
 
   const loadAvailability = useCallback(async (gid) => {
     const { cartelas } = await api.getAvailableCartelas(gid);
@@ -65,6 +66,7 @@ function SelectionContent() {
         const { gameState } = await api.getLobby(stake);
         setGameId(gameState.gameId);
         setStatus(gameState.status);
+        statusRef.current = gameState.status;
         if (gameState.status === 'WAITING') {
           await loadAvailability(gameState.gameId);
         }
@@ -104,11 +106,17 @@ function SelectionContent() {
 
     const onState = (payload) => {
       if (payload.gameId !== gameId) return;
+      const wasWaiting = statusRef.current === 'WAITING';
+      statusRef.current = payload.status;
       setStatus(payload.status);
       if (payload.status === 'WAITING') {
-        // New round started — reset and show the board again.
-        purchasedRef.current = false;
-        setSelected([]);
+        // Only a genuinely NEW round resets the player's picks. The server also
+        // sends WAITING updates during the same round (e.g. after every house
+        // auto-allocation batch); those must not clear what the player selected.
+        if (!wasWaiting) {
+          purchasedRef.current = false;
+          setSelected([]);
+        }
         loadAvailability(gameId).catch(() => {});
       }
     };
@@ -270,12 +278,12 @@ function SelectionContent() {
                     disabled={isTaken || purchasedRef.current}
                     onClick={() => toggleCartela(id)}
                     className={[
-                      'aspect-square rounded-chip text-xs font-mono font-semibold flex items-center justify-center transition-all',
+                      'aspect-square rounded-chip text-sm font-mono font-bold flex items-center justify-center transition-all',
                       isSelected
                         ? 'bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white font-bold scale-105 shadow-lg shadow-violet-500/40 ring-2 ring-white/40'
                         : isTaken
-                        ? 'bg-surface text-line cursor-not-allowed'
-                        : 'bg-surface2 text-ivory active:bg-line'
+                        ? 'bg-violet-500/10 border border-violet-400/30 text-line cursor-not-allowed'
+                        : 'bg-violet-500/10 border border-violet-400/30 text-ivory active:bg-line'
                     ].join(' ')}
                   >
                     {id}
@@ -298,7 +306,7 @@ function SelectionContent() {
             <button
               onClick={handleBuy}
               disabled={selected.length === 0 || busy || !canAfford}
-              className="w-full bg-gradient-to-r from-violet-600 to-fuchsia-600 disabled:bg-line disabled:bg-none disabled:text-mute text-white font-display font-bold text-base py-4 rounded-card active:scale-[0.98] transition-transform shadow-lg shadow-violet-500/30 ring-1 ring-white/20 disabled:ring-0 disabled:shadow-none"
+              className="w-full bg-gradient-to-r from-violet-600 to-fuchsia-600 disabled:bg-violet-500/10 disabled:bg-none disabled:border disabled:border-violet-400/30 disabled:text-mute text-white font-display font-bold text-base py-4 rounded-card active:scale-[0.98] transition-transform shadow-lg shadow-violet-500/30 ring-1 ring-white/20 disabled:ring-0 disabled:shadow-none"
             >
               {!canAfford && selected.length > 0 ? 'Insufficient balance' : busy ? 'Confirming…' : 'Buy Cartela(s)'}
             </button>

@@ -6,7 +6,7 @@ import { api } from '../../lib/api';
 import { notifyHaptic } from '../../lib/telegram';
 
 const DEPOSIT_PHONE = process.env.NEXT_PUBLIC_DEPOSIT_PHONE || '0968200522';
-const CBE_ACCOUNT = process.env.NEXT_PUBLIC_CBE_ACCOUNT || '';
+const CBE_ACCOUNT = process.env.NEXT_PUBLIC_CBE_ACCOUNT || '1000000000000';
 const CBE_ACCOUNT_NAME = process.env.NEXT_PUBLIC_CBE_ACCOUNT_NAME || '';
 
 function WalletContent() {
@@ -38,29 +38,36 @@ function WalletContent() {
 }
 
 function depositPendingReason(reason, method = 'TELEBIRR') {
-  // CBE auto-verification reads a receipt *screenshot* (Telegram bot only), so a
-  // pasted SMS from this page always goes to an admin for manual review.
-  if (method === 'CBE') {
-    return 'CBE deposits submitted here are checked by an admin — you will be notified once it is confirmed. For instant verification, use Deposit in the Telegram bot and send your CBE receipt screenshot.';
-  }
+  const providerLabel = method === 'CBE' ? 'CBE' : 'Telebirr';
   const messages = {
-    UNPARSEABLE: "We couldn't read that as a Telebirr confirmation — an admin will review it manually.",
-    FETCH_FAILED: "We couldn't reach the Telebirr receipt page just now — an admin will review it manually.",
-    TRANSACTION_ID_NOT_FOUND: "The receipt page didn't match — an admin will review it manually.",
-    AMOUNT_MISMATCH: "The amount on the receipt didn't match what you entered — an admin will review it manually.",
-    RECIPIENT_MISMATCH: "This payment doesn't appear to have been sent to our account — an admin will review it manually."
+    UNPARSEABLE: `We couldn't read that as a ${providerLabel} confirmation — an admin will review it manually.`,
+    AMOUNTMATCHES: "The amount in the SMS didn't match what you entered — an admin will review it manually.",
+    RECIPIENTNAMEMATCHES: "This payment doesn't appear to have been sent to our account — an admin will review it manually.",
+    RECIPIENTPHONEMATCHES: "This payment doesn't appear to have been sent to our account — an admin will review it manually.",
+    TRANSACTIONIDFORMATVALID: "We couldn't read the transaction ID in that SMS — an admin will review it manually.",
+    TRANSACTIONIDNOTUSED: 'This receipt has already been used for a previous deposit.',
+    WITHINTIMEWINDOW: 'This SMS is too old to auto-verify — an admin will review it manually.',
+    RECEIPTSLUGFORMATVALID: "We couldn't read the receipt link in that SMS — an admin will review it manually.",
+    RECEIPTSLUGNOTUSED: 'This receipt has already been used for a previous deposit.'
   };
   return messages[reason] || 'We could not verify this automatically — an admin will review it shortly.';
 }
 
 function DepositTab({ onSuccess }) {
-  const [step, setStep] = useState('amount');
   const [method, setMethod] = useState('TELEBIRR');
+  const [step, setStep] = useState('amount');
   const [amount, setAmount] = useState('');
   const [proof, setProof] = useState('');
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  // Whole-Birr rule: fractional Birr has no spendable value here, so any
+  // decimal typed into the amount field is dropped as the user types.
+  const handleAmountChange = (e) => {
+    const digitsOnly = e.target.value.replace(/[^\d]/g, '');
+    setAmount(digitsOnly);
+  };
 
   const submit = async () => {
     setBusy(true);
@@ -114,8 +121,10 @@ function DepositTab({ onSuccess }) {
           <input
             type="number"
             inputMode="numeric"
+            step="1"
+            min="10"
             value={amount}
-            onChange={(e) => setAmount(e.target.value)}
+            onChange={handleAmountChange}
             placeholder="e.g. 100"
             className="w-full bg-surface2 border border-line rounded-chip px-4 py-3 text-ivory font-mono outline-none focus:border-gold"
           />
@@ -132,9 +141,9 @@ function DepositTab({ onSuccess }) {
           {method === 'CBE' ? (
             <div className="bg-surface2 border border-line rounded-card p-4 text-sm">
               <p className="text-mute mb-1">Send <span className="text-gold font-semibold">{amount} Birr</span> via CBE (Commercial Bank of Ethiopia) to:</p>
-              <p className="font-mono text-ivory text-lg mb-1">{CBE_ACCOUNT || 'Account number not configured'}</p>
+              <p className="font-mono text-ivory text-lg mb-1">{CBE_ACCOUNT}</p>
               {CBE_ACCOUNT_NAME && <p className="text-mute text-xs mb-3">Account name: {CBE_ACCOUNT_NAME}</p>}
-              <p className="text-mute text-xs">Then paste the <span className="text-ivory">entire confirmation SMS</span> from CBE below. An admin will verify it — for instant verification, use Deposit in the Telegram bot and send your receipt screenshot.</p>
+              <p className="text-mute text-xs">Then paste the <span className="text-ivory">entire confirmation SMS</span> from CBE below — not just the link.</p>
             </div>
           ) : (
             <div className="bg-surface2 border border-line rounded-card p-4 text-sm">
@@ -206,8 +215,10 @@ function WithdrawTab({ balance, onSuccess }) {
       <input
         type="number"
         inputMode="numeric"
+        step="1"
+        min="1"
         value={amount}
-        onChange={(e) => setAmount(e.target.value)}
+        onChange={(e) => setAmount(e.target.value.replace(/[^\d]/g, ''))}
         placeholder="e.g. 200"
         className="w-full bg-surface2 border border-line rounded-chip px-4 py-3 text-ivory font-mono outline-none focus:border-coral"
       />

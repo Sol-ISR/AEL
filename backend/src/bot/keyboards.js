@@ -52,13 +52,6 @@ function playKeyboard(webAppUrl) {
   return Markup.inlineKeyboard([[Markup.button.webApp('Play Now', webAppUrl)]]);
 }
 
-function walletKeyboard() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('Deposit 💵', 'deposit'), Markup.button.callback('Withdraw 💸', 'withdraw')],
-    [Markup.button.callback('Copy Code 📋', 'copy_code')]
-  ]);
-}
-
 /** Payment-method choice shown right when a player starts a deposit (§4.3). */
 function depositMethodKeyboard() {
   return Markup.inlineKeyboard([
@@ -69,13 +62,50 @@ function depositMethodKeyboard() {
   ]);
 }
 
+function walletKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Deposit 💵', 'deposit'), Markup.button.callback('Withdraw 💸', 'withdraw')],
+    [Markup.button.callback('Copy Code 📋', 'copy_code')]
+  ]);
+}
+
 function adminPanelKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Pending Deposits', 'admin_deposits')],
     [Markup.button.callback('Pending Withdrawals', 'admin_withdrawals')],
     [Markup.button.callback('Manual Credit', 'admin_credit')],
-    [Markup.button.callback('Dashboard Stats', 'admin_dashboard')]
+    [Markup.button.callback('Dashboard Stats', 'admin_dashboard')],
+    [Markup.button.callback('📊 TRANSACTION', 'admin_transactions')],
+    [Markup.button.callback('🏆 WINNERS', 'admin_winners')],
+    // TEMPORARILY HIDDEN: SIMULATOR tab (handlers in webhook.js/commands.js left intact)
+    // [Markup.button.callback('🎯 SIMULATOR', 'admin_simulator')],
+    [Markup.button.callback('🏠 AUTO-ALLOCATION', 'admin_autoalloc')]
   ]);
+}
+
+function autoAllocationKeyboard(enabled) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(enabled ? '⛔ Turn OFF' : '✅ Turn ON', 'admin_autoalloc_toggle')],
+    [
+      Markup.button.callback('✏️ Set amount', 'admin_autoalloc_amount'),
+      Markup.button.callback('🎯 Set ADMIN-WIN-INTERVAL', 'admin_autoalloc_predicted')
+    ],
+    [Markup.button.callback('🔄 Refresh', 'admin_autoalloc')]
+  ]);
+}
+
+/**
+ * Prev/Next row for a paginated admin list. `prefix` is the callback-data
+ * prefix this list's page buttons are registered under in webhook.js (e.g.
+ * 'admin_wd_page'); tapping a button sends `${prefix}_<page>`. Omits a
+ * direction's button rather than disabling it, since Telegram inline
+ * buttons can't be disabled.
+ */
+function paginationKeyboard(prefix, page, totalPages) {
+  const row = [];
+  if (page > 1) row.push(Markup.button.callback('◀️ Prev', `${prefix}_${page - 1}`));
+  if (page < totalPages) row.push(Markup.button.callback('Next ▶️', `${prefix}_${page + 1}`));
+  return Markup.inlineKeyboard(row.length ? [row] : []);
 }
 
 function approveDeclineKeyboard(type, id) {
@@ -122,9 +152,11 @@ module.exports = {
   shareContactKeyboard,
   removeKeyboard,
   playKeyboard,
-  walletKeyboard,
   depositMethodKeyboard,
+  walletKeyboard,
   adminPanelKeyboard,
+  autoAllocationKeyboard,
+  paginationKeyboard,
   approveDeclineKeyboard,
   depositActionKeyboard
 };

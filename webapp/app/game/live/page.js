@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import AuthGate from '../../../components/AuthGate';
 import { useWebSocket } from '../../../hooks/useWebSocket';
@@ -10,11 +10,19 @@ import { hapticFeedback, notifyHaptic } from '../../../lib/telegram';
 // --- CONSTANTS ---
 const LETTERS = ['B', 'I', 'N', 'G', 'O'];
 const COLUMN_ACCENTS = {
-  B: { text: 'text-sky-400', solid: 'bg-sky-500', soft: 'bg-sky-500/15 border-sky-500/40', ring: 'ring-sky-400' },
-  I: { text: 'text-violet-400', solid: 'bg-violet-500', soft: 'bg-violet-500/15 border-violet-500/40', ring: 'ring-violet-400' },
-  N: { text: 'text-pink-400', solid: 'bg-pink-500', soft: 'bg-pink-500/15 border-pink-500/40', ring: 'ring-pink-400' },
-  G: { text: 'text-emerald-400', solid: 'bg-emerald-500', soft: 'bg-emerald-500/15 border-emerald-500/40', ring: 'ring-emerald-400' },
-  O: { text: 'text-amber-400', solid: 'bg-amber-500', soft: 'bg-amber-500/15 border-amber-400/40', ring: 'ring-amber-400' }
+  B: { text: 'text-[#5B84C4]', solid: 'bg-[#1A2C53]', soft: 'bg-[#1A2C53]/20 border-[#5B84C4]/40', ring: 'ring-[#5B84C4]' },
+  I: { text: 'text-[#E356B0]', solid: 'bg-[#C11C84]', soft: 'bg-[#C11C84]/20 border-[#E356B0]/40', ring: 'ring-[#E356B0]' },
+  N: { text: 'text-[#B080BE]', solid: 'bg-[#2F0F39]', soft: 'bg-[#2F0F39]/20 border-[#B080BE]/40', ring: 'ring-[#B080BE]' },
+  G: { text: 'text-[#4FD1B8]', solid: 'bg-[#0E5952]', soft: 'bg-[#0E5952]/20 border-[#4FD1B8]/40', ring: 'ring-[#4FD1B8]' },
+  O: {
+    text: 'text-[#E8B87A]',
+    solid: 'bg-gradient-to-br from-[#F6C97C] to-[#CF9146]',
+    soft: 'bg-[#CF9146]/20 border-[#E8B87A]/40',
+    ring: 'ring-[#E8B87A]',
+    // Rose gold is light, so its header/ball text needs a dark ink instead
+    // of the white used on the other four (all dark) accents.
+    headerText: 'text-[#3D2410]'
+  }
 };
 
 function letterFor(n) {
@@ -22,6 +30,10 @@ function letterFor(n) {
 }
 
 const EMPTY_SET = new Set();
+
+// Persisted on the device so a player's Muted choice survives new rounds,
+// leaving the page, closing Telegram and coming back another day.
+const SOUND_MUTED_KEY = 'bingo:soundMuted';
 
 function LiveContent() {
   const router = useRouter();
@@ -33,8 +45,34 @@ function LiveContent() {
   const [myCartelas, setMyCartelas] = useState([]);
   const [cartelasLoaded, setCartelasLoaded] = useState(false);
   const [autoMode, setAutoMode] = useState(true);
+  const [soundMuted, setSoundMuted] = useState(false);
   const [manualMarks, setManualMarks] = useState({}); // cartelaId -> Set of manually-daubed numbers
   const [navigatedAway, setNavigatedAway] = useState(false);
+
+  // Transition countdown: shown in the "Recent" strip while the round is still
+  // WAITING (selection window open), so a player who has just bought cartelas
+  // can see when number-calling will start. Same source as the selection page:
+  // the server pushes `countdown_update` every second.
+  const [countdown, setCountdown] = useState(null);
+  const isWaiting = gameState.status === 'WAITING';
+
+  useEffect(() => {
+    if (!socket) return undefined;
+    const onCountdown = (payload) => {
+      if (payload?.gameId && gameId && payload.gameId !== gameId) return;
+      setCountdown(payload.remainingSeconds);
+    };
+    socket.on('countdown_update', onCountdown);
+    return () => socket.off('countdown_update', onCountdown);
+  }, [socket, gameId]);
+
+  // Local 1s tick as a resilience fallback (covers a dropped message or a
+  // brief reconnect); every incoming socket payload resyncs the value.
+  useEffect(() => {
+    if (countdown == null || !isWaiting) return undefined;
+    const t = setInterval(() => setCountdown((c) => (c == null ? c : Math.max(0, c - 1))), 1000);
+    return () => clearInterval(t);
+  }, [countdown != null, isWaiting]);
 
   useEffect(() => {
     if (!gameId) return;
@@ -67,8 +105,114 @@ function LiveContent() {
     }
   }, [gameState.winners, gameState.status, gameId, router, navigatedAway]);
 
+  // Play the B-I-N-G-O voice call for each newly-called number. The first
+  // `lastCalled` seen after mount/join is just "whatever the state already
+  // is" (e.g. rejoining mid-round or a page refresh) — not a fresh call —
+  // so it's recorded silently rather than played, and only genuinely new
+  // values after that trigger a sound.
+  const lastPlayedNumberRef = useRef(null);
+  const hasSeenFirstCallRef = useRef(false);
+  // Read via refs rather than effect dependencies, so toggling mute or
+  // backgrounding the app never re-runs/replays the effect — it just changes
+  // what the *next* call does.
+  const soundMutedRef = useRef(false);
+  const isForegroundRef = useRef(true);
+  const activeAudiosRef = useRef(new Set()); // voice clips currently playing
+
+  const stopAllAudio = () => {
+    activeAudiosRef.current.forEach((a) => {
+      try {
+        a.pause();
+        a.currentTime = 0;
+      } catch {}
+    });
+    activeAudiosRef.current.clear();
+  };
+
+  // Load the saved mute preference once on mount (client only).
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(SOUND_MUTED_KEY) === '1';
+      soundMutedRef.current = saved;
+      setSoundMuted(saved);
+    } catch {}
+  }, []);
+
+  const toggleSound = () => {
+    const next = !soundMuted;
+    soundMutedRef.current = next;
+    setSoundMuted(next);
+    if (next) stopAllAudio(); // muting cuts off any call still speaking
+    try {
+      window.localStorage.setItem(SOUND_MUTED_KEY, next ? '1' : '0');
+    } catch {}
+  };
+
+  // Only call numbers while the live page is actually in front of the player.
+  // Silence (and stop) audio when the tab/WebView is hidden, Telegram is
+  // minimized or another app is opened, and when leaving this page (cleanup
+  // runs on unmount, e.g. the Back button).
+  useEffect(() => {
+    const tg = typeof window !== 'undefined' ? window.Telegram?.WebApp : null;
+    let tgActive = true;
+    const apply = () => {
+      const foreground = tgActive && document.visibilityState === 'visible';
+      isForegroundRef.current = foreground;
+      if (!foreground) stopAllAudio();
+    };
+    const onActivated = () => {
+      tgActive = true;
+      apply();
+    };
+    const onDeactivated = () => {
+      tgActive = false;
+      apply();
+    };
+    apply();
+    document.addEventListener('visibilitychange', apply);
+    window.addEventListener('pagehide', stopAllAudio);
+    if (typeof tg?.onEvent === 'function') {
+      tg.onEvent('activated', onActivated);
+      tg.onEvent('deactivated', onDeactivated);
+    }
+    return () => {
+      document.removeEventListener('visibilitychange', apply);
+      window.removeEventListener('pagehide', stopAllAudio);
+      if (typeof tg?.offEvent === 'function') {
+        tg.offEvent('activated', onActivated);
+        tg.offEvent('deactivated', onDeactivated);
+      }
+      stopAllAudio();
+    };
+  }, []);
+
+  useEffect(() => {
+    const lc = gameState.lastCalled;
+    if (!lc) return;
+    if (!hasSeenFirstCallRef.current) {
+      hasSeenFirstCallRef.current = true;
+      lastPlayedNumberRef.current = lc.number;
+      return;
+    }
+    if (lastPlayedNumberRef.current === lc.number) return;
+    // Recorded before the checks below so a call skipped while muted or in
+    // the background is never replayed later.
+    lastPlayedNumberRef.current = lc.number;
+    if (soundMutedRef.current) return;
+    if (!isForegroundRef.current) return;
+    const file = `${lc.letter}${String(lc.number).padStart(2, '0')}.ogg`;
+    const audio = new Audio(`/audio/${file}`);
+    const release = () => activeAudiosRef.current.delete(audio);
+    activeAudiosRef.current.add(audio);
+    audio.addEventListener('ended', release);
+    audio.addEventListener('error', release);
+    // Autoplay can be blocked by the browser/WebView in some states — that's
+    // a silent no-op, never a thrown error the player would see.
+    audio.play().catch(release);
+  }, [gameState.lastCalled]);
+
   const markedSet = useMemo(() => new Set(gameState.calledNumbers), [gameState.calledNumbers]);
-  const netPrizePool = gameState.grossPrizePool ? Math.floor(gameState.grossPrizePool * 0.82) : 0;
+  const netPrizePool = gameState.grossPrizePool ? Math.floor(gameState.grossPrizePool * 0.85) : 0;
   const isSpectator = cartelasLoaded && myCartelas.length === 0;
 
   // Manual mode: the player taps their own cells to daub them. Server-side
@@ -118,7 +262,14 @@ function LiveContent() {
             {/* Circular number calling display */}
             <CurrentBallDisplay lastCalled={gameState.lastCalled} />
 
-            {/* Recent calls strip */}
+            {/* Transition countdown — takes the place of the Recent strip until
+                number-calling starts, then the Recent strip returns. */}
+            {isWaiting && countdown != null ? (
+              <div className="flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 bg-violet-500/10 border border-violet-400/30 rounded-chip py-2">
+                <span className="font-mono font-bold text-violet-300 text-xl leading-none tabular-nums">{countdown}s</span>
+              </div>
+            ) : (
+            /* Recent calls strip */
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 mb-1">
                 <span className="text-[9px] text-mute font-medium uppercase tracking-wide">Recent</span>
@@ -143,6 +294,7 @@ function LiveContent() {
                 )}
               </div>
             </div>
+            )}
           </div>
 
           {/* Cartelas - scrollable */}
@@ -184,10 +336,19 @@ function LiveContent() {
         <button
           onClick={() => setAutoMode((v) => !v)}
           className={`flex-1 py-3 rounded-lg text-sm font-bold border active:scale-[0.98] transition-transform ${
-            autoMode ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40' : 'bg-[#2E3440] text-mute border-[#3A4050]'
+            autoMode ? 'bg-[#0E5952]/20 text-[#4FD1B8] border-[#0E5952]/50' : 'bg-[#2E3440] text-mute border-[#3A4050]'
           }`}
         >
           Auto {autoMode ? 'ON' : 'OFF'}
+        </button>
+        <button
+          onClick={toggleSound}
+          aria-label={soundMuted ? 'Unmute number calls' : 'Mute number calls'}
+          className={`flex-1 py-3 rounded-lg text-sm font-bold border active:scale-[0.98] transition-transform ${
+            soundMuted ? 'bg-[#2E3440] text-mute border-[#3A4050]' : 'bg-[#0E5952]/20 text-[#4FD1B8] border-[#0E5952]/50'
+          }`}
+        >
+          {soundMuted ? '🔇 Muted' : '🔊 Sound'}
         </button>
       </div>
     </div>
@@ -200,7 +361,7 @@ function StatChip({ label, value, tone, compact }) {
     slate: 'bg-[#252A34] border-[#3A4050] text-ivory',
     sky: 'bg-sky-500/10 border-sky-500/30 text-sky-300',
     gold: 'bg-gradient-to-br from-amber-500/20 to-amber-600/10 border-amber-400/40 text-amber-300',
-    emerald: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+    emerald: 'bg-[#0E5952]/15 border-[#0E5952]/40 text-[#4FD1B8]'
   };
   return (
     <div className={`rounded-lg border px-2 py-1 text-center ${tones[tone]} ${compact ? 'flex-1' : ''}`}>
@@ -247,7 +408,7 @@ function CallerBoard({ calledNumbers, lastCalled }) {
         {LETTERS.map((l) => (
           <div
             key={l}
-            className={`text-center text-sm font-extrabold py-1.5 rounded ${COLUMN_ACCENTS[l].solid} text-white shadow-sm`}
+            className={`text-center text-base font-extrabold py-1.5 rounded ${COLUMN_ACCENTS[l].solid} ${COLUMN_ACCENTS[l].headerText || 'text-white'} shadow-sm`}
           >
             {l}
           </div>
@@ -268,7 +429,7 @@ function CallerBoard({ calledNumbers, lastCalled }) {
               <div
                 key={num}
                 className={[
-                  'w-full h-full flex items-center justify-center text-xs font-mono font-bold rounded bg-[#252A34] text-ivory transition-all duration-200',
+                  'w-full h-full flex items-center justify-center text-sm font-mono font-extrabold rounded bg-[#252A34] text-ivory transition-all duration-200',
                   isCalled ? 'bg-amber-300 text-[#111]' : '',
                   isLast ? `!bg-white !text-[#111] scale-105 shadow-lg ring-2 ${accent.ring} z-10` : ''
                 ].join(' ')}
@@ -290,17 +451,14 @@ function CallerBoard({ calledNumbers, lastCalled }) {
 // Only" pattern from Beteseb Bingo — instead of being locked out entirely.
 function NoCartelasBoughtPlaceholder() {
   return (
-    <div className="h-full flex flex-col items-center justify-center text-center px-3 py-8 bg-[#1A1D24] rounded-xl border border-[#2A2F3A]">
+    <div className="h-full flex flex-col items-center justify-center text-center px-4 py-8 bg-gradient-to-b from-[#1A1D24] to-[#20242E] rounded-xl border border-amber-500/20">
       <div className="w-14 h-14 rounded-full bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-2xl mb-3">
-        🎟️
+        🎰
       </div>
-      <p className="text-ivory font-bold text-sm mb-2">WATCHING ONLY</p>
-      <p className="text-mute text-xs leading-relaxed">
-        You can still watch this round live.
-        <br />
-        A new round starts automatically when it ends.
+      <p className="text-amber-300 font-extrabold text-sm mb-2 tracking-wide">
+        ይሄ ዙር ጠርቶ እስኪጨርስ ጠብቁ፤ ክዛ ራሱ ቀጣይ ዙር ይጀምራል።
       </p>
-    </div>
+      </div>
   );
 }
 
@@ -318,7 +476,7 @@ function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) 
       }`}
     >
       <div className="flex justify-between items-center mb-2 px-1">
-        <span className="text-amber-400 text-xs font-extrabold">#{cartela.cartelaId}</span>
+        <span className="text-amber-400 text-sm font-extrabold">ካርቴላ #{cartela.cartelaId}</span>
         {cartela.isWinner && <span className="text-[10px] text-amber-400 font-extrabold animate-pulse">🏆 WINNER</span>}
       </div>
 
@@ -329,7 +487,7 @@ function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) 
           return (
             <div
               key={l}
-              className={`text-center text-xs font-extrabold py-1 rounded ${accent.solid} text-white shadow-sm`}
+              className={`text-center text-sm font-extrabold py-1 rounded ${accent.solid} ${accent.headerText || 'text-white'} shadow-sm`}
             >
               {l}
             </div>
@@ -354,7 +512,7 @@ function CartelaCard({ cartela, calledSet, autoMode, manualMarked, onCellTap }) 
                 onClick={isClickable ? () => onCellTap(cell) : undefined}
                 role={isClickable ? 'button' : undefined}
                 className={[
-                  'aspect-square rounded flex items-center justify-center text-xs font-mono font-bold transition-colors',
+                  'aspect-square rounded flex items-center justify-center text-sm font-mono font-extrabold transition-colors',
                   isFree
                     ? 'bg-emerald-500/20 text-emerald-400'
                     : isMarked

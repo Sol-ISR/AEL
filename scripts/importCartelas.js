@@ -1,18 +1,24 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const mongoose = require('mongoose');
+
+// Use the SAME mongoose copy that the Cartela model uses (backend/node_modules),
+// otherwise connect() and the model end up on different instances and queries time out.
+const backendDir = path.join(__dirname, '..', 'backend');
+const mongoose = require(require.resolve('mongoose', { paths: [backendDir] }));
 const Cartela = require('../backend/src/models/Cartela');
 
 function parseCsv(text) {
-  const [headerLine, ...lines] = text.trim().split('\n');
-  const headers = headerLine.split(',');
-  return lines.map((line) => {
-    const cells = line.split(',');
-    const row = {};
-    headers.forEach((h, i) => { row[h] = cells[i]; });
-    return row;
-  });
+  const [headerLine, ...lines] = text.trim().split(/\r?\n/); // handles Windows \r\n
+  const headers = headerLine.split(',').map((h) => h.trim());
+  return lines
+    .filter((line) => line.trim() !== '')
+    .map((line) => {
+      const cells = line.split(',');
+      const row = {};
+      headers.forEach((h, i) => { row[h] = cells[i] === undefined ? undefined : cells[i].trim(); });
+      return row;
+    });
 }
 
 function rowToGrid(row) {

@@ -12,12 +12,7 @@ const logger = require('../utils/logger');
  */
 function initSocketServer(httpServer) {
   const io = new Server(httpServer, {
-    cors: { origin: process.env.FRONTEND_URL || '*', methods: ['GET', 'POST'] },
-    // Players on weak mobile data stall for several seconds at a time; the
-    // default 20s ping timeout drops them (and triggers a reconnect + re-join
-    // + DB round trips) more often than necessary.
-    pingInterval: 20000,
-    pingTimeout: 35000
+    cors: { origin: process.env.FRONTEND_URL || '*', methods: ['GET', 'POST'] }
   });
 
   const ioredisPair = createIoredisPairIfConfigured();
@@ -35,14 +30,14 @@ function initSocketServer(httpServer) {
   io.use(socketAuthMiddleware);
 
   io.on('connection', (socket) => {
-    logger.debug('Socket connected', { userId: socket.userId });
+    logger.info('Socket connected', { userId: socket.userId });
     socket.join(`user:${socket.userId}`);
 
     registerGameHandlers(io, socket);
     registerUserHandlers(io, socket);
 
     socket.on('disconnect', (reason) => {
-      logger.debug('Socket disconnected', { userId: socket.userId, reason });
+      logger.info('Socket disconnected', { userId: socket.userId, reason });
     });
   });
 
