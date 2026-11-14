@@ -29,7 +29,7 @@ class DepositController {
             // Process deposit
             const result = await walletService.processDepositViaSMS({
                 userId,
-                amount: parseFloat(amount),
+                amount: Math.round(parseFloat(amount)),
                 smsText,
                 botSessionId: botSessionId || 'unknown'
             });

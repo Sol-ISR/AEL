@@ -11,17 +11,29 @@ const userSchema = new Schema({
   phone: { type: String, required: true, unique: true },
   displayName: String,
   walletAddress: String,
-  mainWalletBalance: { type: Number, default: 0 },
+  // Whole Birr only: the getter hides any stray float residue (e.g. 7.99999996)
+// already stored or produced by arithmetic; the setter keeps new writes whole.
+mainWalletBalance: {
+    type: Number,
+    default: 0,
+    get: (v) => (typeof v === 'number' ? Math.round(v) : v),
+    set: (v) => (typeof v === 'number' ? Math.round(v) : v)
+  },
   coins: { type: Number, default: 0 }, // Phase 2 - Out of Scope for v1
   isAdmin: { type: Boolean, default: false },
   referralCode: { type: String, unique: true, sparse: true }, // Phase 2
   referredBy: { type: Schema.Types.ObjectId, ref: 'User' }, // Phase 2
   totalGamesPlayed: { type: Number, default: 0 },
   totalWins: { type: Number, default: 0 },
-  totalWinnings: { type: Number, default: 0 },
+  totalWinnings: {
+    type: Number,
+    default: 0,
+    get: (v) => (typeof v === 'number' ? Math.round(v) : v),
+    set: (v) => (typeof v === 'number' ? Math.round(v) : v)
+  },
   createdAt: { type: Date, default: Date.now },
   lastActive: { type: Date, default: Date.now }
-});
+}, { toJSON: { getters: true }, toObject: { getters: true } });
 
 userSchema.index({ telegramId: 1 }, { unique: true });
 userSchema.index({ phone: 1 }, { unique: true });

@@ -6,10 +6,14 @@ const { Schema } = mongoose;
 // atomically alongside every write that touches it (§7.1/§7.2).
 const houseWalletSchema = new Schema({
   walletId: { type: String, required: true, default: 'house', unique: true },
-  balance: { type: Number, default: 0 },
+  balance: {
+    type: Number,
+    default: 0,
+    get: (v) => (typeof v === 'number' ? Math.round(v) : v)
+  },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
-});
+}, { toJSON: { getters: true }, toObject: { getters: true } });
 
 houseWalletSchema.pre('save', function preSave(next) {
   this.updatedAt = new Date();
